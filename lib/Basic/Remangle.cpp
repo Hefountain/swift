@@ -24,6 +24,7 @@
 #include "swift/Strings.h"
 #include "llvm/ADT/StringRef.h"
 #include <vector>
+#include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
 
@@ -121,9 +122,10 @@ static void mangleIdentifier(StringRef ident, OperatorKind operatorKind,
 void Demangle::mangleIdentifier(const char *data, size_t length,
                                 OperatorKind operatorKind,
                                 std::string &out, bool usePunycode) {
-  DemanglerPrinter printer(out);
-  return ::mangleIdentifier(StringRef(data, length), operatorKind,
-                            usePunycode, printer);
+  DemanglerPrinter printer;
+  ::mangleIdentifier(StringRef(data, length), operatorKind,
+                     usePunycode, printer);
+  out = std::move(printer).str();
 }
 
 namespace {
@@ -303,7 +305,6 @@ namespace {
     void mangleEntityContext(Node *node, EntityContext &ctx);
     void mangleEntityType(Node *node, EntityContext &ctx);
     void mangleEntityGenericType(Node *node, EntityContext &ctx);
-    void mangleGenerics(Node *node, EntityContext &ctx);
 
     bool trySubstitution(Node *node, SubstitutionEntry &entry);
     void addSubstitution(const SubstitutionEntry &entry);
@@ -452,6 +453,16 @@ void Remangler::mangleGenericSpecialization(Node *node) {
   // Start another mangled name.
   Out << "__T";
 }
+void Remangler::mangleGenericSpecializationNotReAbstracted(Node *node) {
+  Out << "TSr";
+  mangleChildNodes(node); // GenericSpecializationParams
+
+  // Specializations are just prepended to already-mangled names.
+  resetSubstitutions();
+
+  // Start another mangled name.
+  Out << "__T";
+}
 void Remangler::mangleGenericSpecializationParam(Node *node) {
   // Should be a type followed by a series of protocol conformances.
   mangleChildNodes(node);
@@ -471,6 +482,10 @@ void Remangler::mangleFunctionSignatureSpecialization(Node *node) {
 
 void Remangler::mangleSpecializationPassID(Node *node) {
   Out << node->getIndex();
+}
+
+void Remangler::mangleSpecializationIsFragile(Node *node) {
+  Out << "q";
 }
 
 void Remangler::mangleFunctionSignatureSpecializationParam(Node *node) {
@@ -939,9 +954,6 @@ void Remangler::mangleEntityType(Node *node, EntityContext &ctx) {
 
   // Expand certain kinds of type within the entity context.
   switch (node->getKind()) {
-  case Node::Kind::GenericType:
-    mangleEntityGenericType(node, ctx);
-    return;
   case Node::Kind::FunctionType:
   case Node::Kind::UncurriedFunctionType: {
     Out << (node->getKind() == Node::Kind::FunctionType ? 'F' : 'f');
@@ -1093,9 +1105,12 @@ void Remangler::mangleImplFunctionType(Node *node) {
          i->get()->getKind() == Node::Kind::ImplFunctionAttribute; ++i) {
     mangle(i->get()); // impl function attribute
   }
-  EntityContext ctx(*this);
-  if (i != e && i->get()->getKind() == Node::Kind::Generics) {
-    mangleGenerics((i++)->get(), ctx);
+  if (i != e &&
+      (i->get()->getKind() == Node::Kind::DependentGenericSignature ||
+       i->get()->getKind() == Node::Kind::DependentPseudogenericSignature)) {
+    Out << (i->get()->getKind() == Node::Kind::DependentGenericSignature
+              ? 'G' : 'g');
+    mangleDependentGenericSignature((i++)->get());
   }
   Out << '_';
   for (; i != e && i->get()->getKind() == Node::Kind::ImplParameter; ++i) {
@@ -1149,7 +1164,7 @@ void Remangler::mangleImplConvention(Node *node) {
   } else if (text == "@unowned") {
     Out << 'd';
   } else if (text == "@unowned_inner_pointer") {
-    Out << 'd'; // only in results
+    Out << 'D'; // only in results
   } else if (text == "@guaranteed") {
     Out << 'g';
   } else if (text == "@deallocating") {
@@ -1278,19 +1293,8 @@ void Remangler::mangleDependentGenericType(Node *node) {
   mangleChildNodes(node); // generic signature, type
 }
 
-void Remangler::mangleGenericType(Node *node) {
-  EntityContext ctx(*this);
-  mangleEntityGenericType(node, ctx);
-}
-
-void Remangler::mangleEntityGenericType(Node *node, EntityContext &ctx) {
-  assert(node->getKind() == Node::Kind::GenericType);
-
-  Out << 'U';
-  assert(node->getNumChildren() == 2);
-
-  mangleGenerics(node->begin()[0].get(), ctx);
-  mangleEntityType(node->begin()[1].get(), ctx);
+void Remangler::mangleDependentPseudogenericSignature(Node *node) {
+  mangleDependentGenericSignature(node);
 }
 
 void Remangler::mangleDependentGenericSignature(Node *node) {
@@ -1359,31 +1363,6 @@ void Remangler::mangleConstrainedType(Node *node) {
     mangleDependentGenericParamIndex(node->getFirstChild().get());
   } else {
     mangle(node);
-  }
-}
-
-void Remangler::mangleGenerics(Node *node) {
-  unreachable("found independent generics node?");
-}
-
-void Remangler::mangleGenerics(Node *node, EntityContext &ctx) {
-  assert(node->getKind() == Node::Kind::Generics);
-
-  unsigned absoluteDepth = ++AbsoluteArchetypeDepth;
-
-  auto i = node->begin(), e = node->end();
-  unsigned index = 0;
-  for (; i != e && i->get()->getKind() == Node::Kind::Archetype; ++i) {
-    auto child = i->get();
-    Archetypes[child->getText()] = ArchetypeInfo{index++, absoluteDepth};
-    mangle(child); // archetype
-  }
-  if (i != e) {
-    Out << 'U';
-    mangleNodes(i, e); // associated types
-    Out << '_';
-  } else {
-    Out << '_';
   }
 }
 
@@ -1599,8 +1578,7 @@ void Remangler::mangleTypeList(Node *node) {
 std::string Demangle::mangleNode(const NodePointer &node) {
   if (!node) return "";
 
-  std::string str;
-  DemanglerPrinter printer(str);
+  DemanglerPrinter printer;
   Remangler(printer).mangle(node.get());
-  return str;
+  return std::move(printer).str();
 }

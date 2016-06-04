@@ -21,6 +21,7 @@
 #include "swift/AST/DeclContext.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/Type.h"
+#include "swift/AST/TypeAlignments.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/STLExtras.h"
@@ -45,16 +46,22 @@ class alignas(8) TypeRepr {
   void operator=(const TypeRepr&) = delete;
 
   /// \brief The subclass of TypeRepr that this is.
-  unsigned Kind : 7;
+  unsigned Kind : 6;
 
   /// Whether this type representation is known to contain an invalid
   /// type.
   unsigned Invalid : 1;
 
+  /// Whether this type representation had a warning emitted related to it.
+  /// This is a hack related to how we resolve type exprs multiple times in
+  /// generic contexts.
+  unsigned Warned : 1;
+
   SourceLoc getLocImpl() const { return getStartLoc(); }
 
 protected:
-  TypeRepr(TypeReprKind K) : Kind(static_cast<unsigned>(K)), Invalid(false) {}
+  TypeRepr(TypeReprKind K)
+    : Kind(static_cast<unsigned>(K)), Invalid(false), Warned(false) {}
 
 public:
   TypeReprKind getKind() const { return static_cast<TypeReprKind>(Kind); }
@@ -65,6 +72,11 @@ public:
   /// Note that this type representation describes an invalid type.
   void setInvalid() { Invalid = true; }
 
+  /// If a warning is produced about this type repr, keep track of that so we
+  /// don't emit another one upon further reanalysis.
+  bool isWarnedAbout() const { return Warned; }
+  void setWarned() { Warned = true; }
+  
   /// Get the representative location for pointing at this type.
   SourceLoc getLoc() const;
 
@@ -150,6 +162,7 @@ public:
   }
 
   const TypeAttributes &getAttrs() const { return Attrs; }
+  void setAttrs(const TypeAttributes &attrs) { Attrs = attrs; }
   TypeRepr *getTypeRepr() const { return Ty; }
 
   void printAttrs(llvm::raw_ostream &OS) const;
@@ -351,21 +364,33 @@ inline IdentTypeRepr::ComponentRange IdentTypeRepr::getComponentRange() {
 ///   Foo -> Bar
 /// \endcode
 class FunctionTypeRepr : public TypeRepr {
-  GenericParamList *Generics;
+  // These two are only used in SIL mode, which is the only time
+  // we can have polymorphic function values.
+  GenericParamList *GenericParams;
+  GenericSignature *GenericSig;
+
   TypeRepr *ArgsTy;
   TypeRepr *RetTy;
   SourceLoc ArrowLoc;
   SourceLoc ThrowsLoc;
 
 public:
-  FunctionTypeRepr(GenericParamList *generics, TypeRepr *argsTy,
+  FunctionTypeRepr(GenericParamList *genericParams, TypeRepr *argsTy,
                    SourceLoc throwsLoc, SourceLoc arrowLoc, TypeRepr *retTy)
     : TypeRepr(TypeReprKind::Function),
-      Generics(generics), ArgsTy(argsTy), RetTy(retTy),
+      GenericParams(genericParams), GenericSig(nullptr),
+      ArgsTy(argsTy), RetTy(retTy),
       ArrowLoc(arrowLoc), ThrowsLoc(throwsLoc) {
   }
 
-  GenericParamList *getGenericParams() const { return Generics; }
+  GenericParamList *getGenericParams() const { return GenericParams; }
+  GenericSignature *getGenericSignature() const { return GenericSig; }
+
+  void setGenericSignature(GenericSignature *genericSig) {
+    assert(GenericSig == nullptr);
+    GenericSig = genericSig;
+  }
+
   TypeRepr *getArgsTypeRepr() const { return ArgsTy; }
   TypeRepr *getResultTypeRepr() const { return RetTy; }
   bool throws() const { return ThrowsLoc.isValid(); }

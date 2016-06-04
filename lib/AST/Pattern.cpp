@@ -237,6 +237,16 @@ void Pattern::forEachNode(const std::function<void(Pattern*)> &f) {
   }
 }
 
+bool Pattern::hasStorage() const {
+  bool HasStorage = false;
+  forEachVariable([&](VarDecl *VD) {
+    if (VD->hasStorage())
+      HasStorage = true;
+  });
+
+  return HasStorage;
+}
+
 /// Return true if this is a non-resolved ExprPattern which is syntactically
 /// irrefutable.
 static bool isIrrefutableExprPattern(const ExprPattern *EP) {
@@ -317,11 +327,11 @@ TuplePattern *TuplePattern::create(ASTContext &C, SourceLoc lp,
     implicit = !lp.isValid();
 
   unsigned n = elts.size();
-  void *buffer = C.Allocate(sizeof(TuplePattern) + n * sizeof(TuplePatternElt),
+  void *buffer = C.Allocate(totalSizeToAlloc<TuplePatternElt>(n),
                             alignof(TuplePattern));
   TuplePattern *pattern = ::new (buffer) TuplePattern(lp, n, rp, *implicit);
-  memcpy(pattern->getElementsBuffer(), elts.data(),
-         n * sizeof(TuplePatternElt));
+  std::uninitialized_copy(elts.begin(), elts.end(),
+                          pattern->getTrailingObjects<TuplePatternElt>());
   return pattern;
 }
 
@@ -370,8 +380,7 @@ NominalTypePattern *NominalTypePattern::create(TypeLoc CastTy,
                                                SourceLoc RParenLoc,
                                                ASTContext &C,
                                                Optional<bool> implicit) {
-  void *buf = C.Allocate(sizeof(NominalTypePattern)
-                           + sizeof(Element) * Elements.size(),
+  void *buf = C.Allocate(totalSizeToAlloc<Element>(Elements.size()),
                          alignof(Element));
   return ::new (buf) NominalTypePattern(CastTy, LParenLoc, Elements, RParenLoc,
                                         implicit);

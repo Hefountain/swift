@@ -30,7 +30,6 @@
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/TypeCheckerDebugConsumer.h"
-#include "llvm/ADT/Fixnum.h"
 #include "llvm/ADT/ilist.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -616,9 +615,14 @@ public:
   /// on a suspicious top-level optional injection (because the caller already
   /// diagnosed it).
   ///
+  /// \param typeFromPattern Optionally, the caller can specify the pattern
+  /// from where the toType is derived, so that we can deliver better fixit.
+  ///
   /// \returns the coerced expression, which will have type \c ToType.
-  Expr *coerceToType(Expr *expr, Type toType, ConstraintLocator *locator,
-                     bool ignoreTopLevelInjection = false) const;
+  Expr *coerceToType(Expr *expr, Type toType,
+                     ConstraintLocator *locator,
+                     bool ignoreTopLevelInjection = false,
+                     Optional<Pattern*> typeFromPattern = None) const;
 
   /// \brief Convert the given expression to a logic value.
   ///
@@ -780,7 +784,11 @@ typedef llvm::ilist<Constraint> ConstraintList;
 
 enum class ConstraintSystemFlags {
   /// Whether we allow the solver to attempt fixes to the system.
-  AllowFixes = 0x01
+  AllowFixes = 0x01,
+  
+  /// Set if the client prefers fixits to be in the form of force unwrapping
+  /// or optional chaining to return an optional.
+  PreferForceUnwrapToOptional = 0x02,
 };
 
 /// Options that affect the constraint system as a whole.
@@ -817,7 +825,7 @@ struct MemberLookupResult {
     /// Argument labels don't match.
     UR_LabelMismatch,
     
-    /// This uses a type like Self it its signature that cannot be used on an
+    /// This uses a type like Self in its signature that cannot be used on an
     /// existential box.
     UR_UnavailableInExistential,
     
@@ -825,7 +833,7 @@ struct MemberLookupResult {
     /// type.
     UR_InstanceMemberOnType,
     
-    /// This is a static/class member being access through an instance.
+    /// This is a static/class member being accessed through an instance.
     UR_TypeMemberOnInstance,
     
     /// This is a mutating member, being used on an rvalue.
@@ -883,6 +891,10 @@ public:
 
   Constraint *failedConstraint = nullptr;
 
+  /// Expressions that are known to be unevaluated.
+  /// Note: this is only used to support ObjCSelectorExpr at the moment.
+  llvm::SmallPtrSet<Expr *, 2> UnevaluatedRootExprs;
+
 private:
 
   /// \brief Allocator used for all of the related constraint systems.
@@ -930,7 +942,7 @@ private:
   /// There can only be a single contextual type on the root of the expression
   /// being checked.  If specified, this holds its type along with the base
   /// expression, and the purpose of it.
-  Type contextualType;
+  TypeLoc contextualType;
   Expr *contextualTypeNode = nullptr;
   ContextualTypePurpose contextualTypePurpose = CTP_Unused;
   
@@ -948,9 +960,6 @@ private:
   ///
   /// Each fix is paired with a locator that describes where the fix occurs.
   SmallVector<std::pair<Fix, ConstraintLocator *>, 4> Fixes;
-
-  /// The names used in relabel-tuple fixes.
-  std::vector<ArrayRef<Identifier>> RelabelTupleNames;
 
   /// Types used in fixes.
   std::vector<Type> FixedTypes;
@@ -1033,11 +1042,16 @@ public:
   /// we're exploring. 
   SolverState *solverState = nullptr;
 
+  struct ArgumentLabelState {
+    ArrayRef<Identifier> Labels;
+    bool HasTrailingClosure;
+  };
+
   /// A mapping from the constraint locators for references to various
   /// names (e.g., member references, normal name references, possible
   /// constructions) to the argument labels provided in the call to
   /// that locator.
-  llvm::DenseMap<ConstraintLocator *, ArrayRef<Identifier>> ArgumentLabels;
+  llvm::DenseMap<ConstraintLocator *, ArgumentLabelState> ArgumentLabels;
 
   /// FIXME: This is a workaround for the way we perform protocol
   /// conformance checking for generic requirements, where we re-use
@@ -1213,16 +1227,20 @@ public:
     this->FavoredTypes[E] = T;
   }
  
-  void setContextualType(Expr *E, Type T, ContextualTypePurpose purpose) {
+  void setContextualType(Expr *E, TypeLoc T, ContextualTypePurpose purpose) {
     contextualTypeNode = E;
     contextualType = T;
     contextualTypePurpose = purpose;
   }
 
   Type getContextualType(Expr *E) const {
-    return E == contextualTypeNode ? contextualType : Type();
+    return E == contextualTypeNode ? contextualType.getType() : Type();
   }
   Type getContextualType() const {
+    return contextualType.getType();
+  }
+
+  TypeLoc getContextualTypeLoc() const {
     return contextualType;
   }
 
@@ -1295,11 +1313,6 @@ public:
   /// invalid, emit a detailed error about the condition.
   void diagnoseAssignmentFailure(Expr *dest, Type destTy, SourceLoc equalLoc);
 
-  
-  /// Diagnose an argument labeling issue, returning true if we successfully
-  /// diagnosed the issue.
-  bool diagnoseArgumentLabelError(Expr *expr, ArrayRef<Identifier> newNames,
-                                  bool isSubscript);
   
   /// \brief Mine the active and inactive constraints in the constraint
   /// system to generate a plausible diagnosis of why the system could not be
@@ -1552,6 +1565,12 @@ public:
   /// declaration's signature, but they do not have to, so they might not be
   /// substituted at all. Since the inner declaration inherits the context
   /// archetypes of the outer function we do not need to open them here.
+  void openGeneric(DeclContext *dc,
+                   GenericSignature *signature,
+                   bool skipProtocolSelfConstraint,
+                   unsigned minOpeningDepth,
+                   ConstraintLocatorBuilder locator,
+                   llvm::DenseMap<CanType, TypeVariableType *> &replacements);
   void openGeneric(DeclContext *dc,
                    ArrayRef<GenericTypeParamType *> params,
                    ArrayRef<Requirement> requirements,
@@ -2203,6 +2222,14 @@ bool matchCallArguments(ArrayRef<CallArgParam> argTuple,
                         bool allowFixes,
                         MatchCallArgumentListener &listener,
                         SmallVectorImpl<ParamBinding> &parameterBindings);
+
+/// Attempt to prove that arguments with the given labels at the
+/// given parameter depth cannot be used with the given value.
+/// If this cannot be proven, conservatively returns true.
+bool areConservativelyCompatibleArgumentLabels(ValueDecl *decl,
+                                               unsigned parameterDepth,
+                                               ArrayRef<Identifier> labels,
+                                               bool hasTrailingClosure);
 
 /// Simplify the given locator by zeroing in on the most specific
 /// subexpression described by the locator.

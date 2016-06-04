@@ -97,10 +97,15 @@ namespace swift {
     void injectFunction(SILFunction *Func) { F = Func; }
 
     /// \brief Notify the pass manager of a function that needs to be
-    /// processed by the function passes.
+    /// processed by the function passes and the analyses.
     void notifyPassManagerOfFunction(SILFunction *F) {
-      PM->addFunctionToWorklist(F);
+      PM->notifyTransformationOfFunction(F);
+      PM->notifyAnalysisOfFunction(F);
     }
+
+    /// \brief Reoptimize the current function by restarting the pass
+    /// pipeline on it.
+    void restartPassPipeline() { PM->restartWithCurrentFunction(this); }
 
   protected:
     SILFunction *getFunction() { return F; }
@@ -140,8 +145,13 @@ namespace swift {
       PM->invalidateAnalysis(F, K);
     }
 
+    /// Invalidate only the function \p F, using invalidation information \p K.
+    /// But we also know this function is going to be dead.
+    void invalidateAnalysisForDeadFunction(SILFunction *F,
+                                           SILAnalysis::InvalidationKind K) {
+      PM->invalidateAnalysisForDeadFunction(F, K);
+    }
   };
-
 } // end namespace swift
 
 #endif

@@ -2,7 +2,7 @@ set(LLVM_TARGET_DEFINITIONS Options.td)
 tablegen(LLVM Options.inc -gen-opt-parser-defs)
 add_public_tablegen_target(sourcekitdTestOptionsTableGen)
 
-if( SWIFT_SOURCEKIT_USE_INPROC_LIBRARY )
+if(SWIFT_SOURCEKIT_USE_INPROC_LIBRARY)
   set(SOURCEKITD_TEST_DEPEND sourcekitdInProc)
 else()
   set(SOURCEKITD_TEST_DEPEND sourcekitd)
@@ -25,7 +25,7 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 
   if(SWIFT_ANALYZE_CODE_COVERAGE)
     set_property(TARGET sourcekitd-test APPEND_STRING PROPERTY
-        LINK_FLAGS " -fprofile-instr-generate=swift-%p.profraw -fcoverage-mapping")
+      LINK_FLAGS " -fprofile-instr-generate -fcoverage-mapping")
   endif()
 endif()
 

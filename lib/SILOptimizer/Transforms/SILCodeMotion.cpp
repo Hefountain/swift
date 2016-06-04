@@ -13,7 +13,6 @@
 #define DEBUG_TYPE "sil-codemotion"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/Basic/BlotMapVector.h"
-#include "swift/SIL/Projection.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILType.h"
@@ -29,11 +28,15 @@
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
-STATISTIC(NumSunk,   "Number of instructions sunk");
-STATISTIC(NumRefCountOpsSimplified, "number of enum ref count ops simplified.");
+STATISTIC(NumSunk, "Number of instructions sunk");
+STATISTIC(NumRefCountOpsSimplified, "Number of enum ref count ops simplified");
 STATISTIC(NumHoisted, "Number of instructions hoisted");
+STATISTIC(NumSILArgumentReleaseHoisted, "Number of silargument release instructions hoisted");
+
+llvm::cl::opt<bool> DisableSILRRCodeMotion("disable-sil-cm-rr-cm", llvm::cl::init(true));
 
 using namespace swift;
 
@@ -42,6 +45,10 @@ namespace {
 //===----------------------------------------------------------------------===//
 //                                  Utility
 //===----------------------------------------------------------------------===//
+
+static bool isReleaseInstruction(SILInstruction *I) {
+  return isa<StrongReleaseInst>(I) || isa<ReleaseValueInst>(I);
+}
 
 static void createRefCountOpForPayload(SILBuilder &Builder, SILInstruction *I,
                                        EnumElementDecl *EnumDecl,
@@ -75,12 +82,12 @@ static void createRefCountOpForPayload(SILBuilder &Builder, SILInstruction *I,
     // And our payload is refcounted, insert a strong_retain onto the
     // payload.
     if (UEDITy.isReferenceCounted(Mod)) {
-      Builder.createStrongRetain(I->getLoc(), UEDI);
+      Builder.createStrongRetain(I->getLoc(), UEDI, Atomicity::Atomic);
       return;
     }
 
     // Otherwise, insert a retain_value on the payload.
-    Builder.createRetainValue(I->getLoc(), UEDI);
+    Builder.createRetainValue(I->getLoc(), UEDI, Atomicity::Atomic);
     return;
   }
 
@@ -91,18 +98,59 @@ static void createRefCountOpForPayload(SILBuilder &Builder, SILInstruction *I,
 
   // If our payload has reference semantics, insert the strong release.
   if (UEDITy.isReferenceCounted(Mod)) {
-    Builder.createStrongRelease(I->getLoc(), UEDI);
+    Builder.createStrongRelease(I->getLoc(), UEDI, Atomicity::Atomic);
     return;
   }
 
   // Otherwise if our payload is non-trivial but lacking reference semantics,
   // insert the release_value.
-  Builder.createReleaseValue(I->getLoc(), UEDI);
+  Builder.createReleaseValue(I->getLoc(), UEDI, Atomicity::Atomic);
 }
 
 //===----------------------------------------------------------------------===//
 //                            Generic Sinking Code
 //===----------------------------------------------------------------------===//
+
+/// \brief Hoist release on a SILArgument to its predecessors.
+static bool hoistSILArgumentReleaseInst(SILBasicBlock *BB) {
+  // There is no block to hoist releases to.
+  if (BB->pred_empty())
+    return false;
+
+  // Only try to hoist the first instruction. RRCM should have hoisted the release
+  // to the beginning of the block if it can.
+  auto Head = &*BB->begin();
+  // Make sure it is a release instruction.
+  if (!isReleaseInstruction(&*Head))
+    return false;
+
+  // Make sure it is a release on a SILArgument of the current basic block..
+  SILArgument *SA = dyn_cast<SILArgument>(Head->getOperand(0));
+  if (!SA || SA->getParent() != BB)
+    return false;
+
+  // Make sure the release will not be blocked by the terminator instructions
+  // Make sure the terminator does not block, nor is a branch with multiple targets.
+  for (auto P : BB->getPreds()) {
+    if (!isa<BranchInst>(P->getTerminator()))
+      return false;
+  }
+
+  // Make sure we can get all the incoming values.
+  llvm::SmallVector<SILValue , 4> PredValues;
+  if (!SA->getIncomingValues(PredValues))
+    return false;
+
+  // Ok, we can get all the incoming values and create releases for them.
+  unsigned indices = 0;
+  for (auto P : BB->getPreds()) {
+    createDecrementBefore(PredValues[indices++], P->getTerminator());
+  }
+  // Erase the old instruction.
+  Head->eraseFromParent();
+  ++NumSILArgumentReleaseHoisted;
+  return true;
+}
 
 static const int SinkSearchWindow = 6;
 
@@ -860,10 +908,10 @@ static bool tryToSinkRefCountInst(SILBasicBlock::iterator T,
 
     Builder.setInsertionPoint(&*SuccBB->begin());
     if (isa<StrongRetainInst>(I)) {
-      Builder.createStrongRetain(I->getLoc(), Ptr);
+      Builder.createStrongRetain(I->getLoc(), Ptr, Atomicity::Atomic);
     } else {
       assert(isa<RetainValueInst>(I) && "This can only be retain_value");
-      Builder.createRetainValue(I->getLoc(), Ptr);
+      Builder.createRetainValue(I->getLoc(), Ptr, Atomicity::Atomic);
     }
   }
 
@@ -964,10 +1012,12 @@ static bool hoistDecrementsToPredecessors(SILBasicBlock *BB, AliasAnalysis *AA,
       Builder.setInsertionPoint(PredBB->getTerminator());
       SILInstruction *Release;
       if (isa<StrongReleaseInst>(Inst)) {
-        Release = Builder.createStrongRelease(Inst->getLoc(), Ptr);
+        Release =
+            Builder.createStrongRelease(Inst->getLoc(), Ptr, Atomicity::Atomic);
       } else {
         assert(isa<ReleaseValueInst>(Inst) && "This can only be retain_value");
-        Release = Builder.createReleaseValue(Inst->getLoc(), Ptr);
+        Release =
+            Builder.createReleaseValue(Inst->getLoc(), Ptr, Atomicity::Atomic);
       }
       // Update the last instruction to consider when looking for ARC uses or
       // decrements in predecessor blocks.
@@ -1649,7 +1699,8 @@ sinkIncrementsOutOfSwitchRegions(AliasAnalysis *AA,
     // TODO: Which debug loc should we use here? Using one of the locs from the
     // delete list seems reasonable for now...
     SILBuilder(getBB()->begin()).createRetainValue(DeleteList[0]->getLoc(),
-                                                   EnumValue);
+                                                   EnumValue,
+                                                   Atomicity::Atomic);
     for (auto *I : DeleteList)
       I->eraseFromParent();
     ++NumSunk;
@@ -1711,17 +1762,20 @@ static bool processFunction(SILFunction *F, AliasAnalysis *AA,
     Changed |= sinkCodeFromPredecessors(State.getBB());
     Changed |= sinkArgumentsFromPredecessors(State.getBB());
     Changed |= sinkLiteralsFromPredecessors(State.getBB());
+    // Try to hoist release of a SILArgument to predecessors.
+    Changed |= hoistSILArgumentReleaseInst(State.getBB());
 
     // Then perform the dataflow.
     DEBUG(llvm::dbgs() << "    Performing the dataflow!\n");
     Changed |= State.process();
 
     // Finally we try to sink retain instructions from this BB to the next BB.
-    Changed |= sinkRefCountIncrement(State.getBB(), AA, RCIA);
+    if (!DisableSILRRCodeMotion)
+      Changed |= sinkRefCountIncrement(State.getBB(), AA, RCIA);
 
     // And hoist decrements to predecessors. This is beneficial if we can then
     // match them up with an increment in some of the predecessors.
-    if (HoistReleases)
+    if (!DisableSILRRCodeMotion && HoistReleases)
       Changed |= hoistDecrementsToPredecessors(State.getBB(), AA, RCIA);
   }
 

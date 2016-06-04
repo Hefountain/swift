@@ -14,15 +14,17 @@ add_swift_library(swiftStdlibCollectionUnittest SHARED IS_STDLIB
   # filename.
   StdlibCollectionUnittest.swift
 
-  CheckCollectionType.swift
+  CheckCollectionInstance.swift.gyb
+  CheckCollectionType.swift.gyb
   CheckMutableCollectionType.swift.gyb
   CheckRangeReplaceableCollectionType.swift
   CheckRangeReplaceableSliceType.swift
+  CheckSequenceInstance.swift.gyb
   CheckSequenceType.swift
   LoggingWrappers.swift.gyb
   MinimalCollections.swift.gyb
+  ../../public/core/WriteBackMutableSlice.swift
 
-  PRIVATE_LINK_LIBRARIES ${swift_stdlib_unittest_private_link_libraries}
   SWIFT_MODULE_DEPENDS StdlibUnittest
   SWIFT_COMPILE_FLAGS ${swift_stdlib_unittest_compile_flags}
   FRAMEWORK_DEPENDS ${swift_stdlib_unittest_framework_depends}

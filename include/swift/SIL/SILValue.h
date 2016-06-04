@@ -85,7 +85,7 @@ public:
   void replaceAllUsesWith(ValueBase *RHS);
 
   /// Returns true if this value has no uses.
-  /// To ignore debug-info instructions use swift::hasNoUsesExceptDebug instead
+  /// To ignore debug-info instructions use swift::onlyHaveDebugUses instead
   /// (see comment in DebugUtils.h).
   bool use_empty() const { return FirstUse == nullptr; }
 
@@ -227,8 +227,6 @@ public:
     // It's probably not worth optimizing for the case of switching
     // operands on a single value.
     removeFromCurrent();
-    assert(reinterpret_cast<ValueBase *>(Owner) != newValue &&
-        "Cannot add a value as an operand of the instruction that defines it!");
     TheValue = newValue;
     insertIntoCurrent();
   }

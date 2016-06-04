@@ -10,7 +10,7 @@ func ~= (x: (Int,Int,Int), y: (Int,Int,Int)) -> Bool {
 
 var x:Int
 
-func square(x: Int) -> Int { return x*x }
+func square(_ x: Int) -> Int { return x*x }
 
 struct A<B> {
   struct C<D> { } // expected-error{{generic type 'C' nested in type}}
@@ -77,31 +77,31 @@ enum Voluntary<T> : Equatable {
   case Twain(T, T)
 
 
-  func enumMethod(other: Voluntary<T>, foo: Foo) {
+  func enumMethod(_ other: Voluntary<T>, foo: Foo) {
     switch self {
     case other:
       ()
 
-    case Naught,
-         Naught(),
-         Naught(_, _): // expected-error{{tuple pattern has the wrong length for tuple type '()'}}
+    case .Naught,
+         .Naught(),
+         .Naught(_, _): // expected-error{{tuple pattern has the wrong length for tuple type '()'}}
       ()
 
-    case Mere,
-         Mere(), // expected-error{{tuple pattern cannot match values of the non-tuple type 'T'}}
-         Mere(_),
-         Mere(_, _): // expected-error{{tuple pattern cannot match values of the non-tuple type 'T'}}
+    case .Mere,
+         .Mere(), // expected-error{{tuple pattern cannot match values of the non-tuple type 'T'}}
+         .Mere(_),
+         .Mere(_, _): // expected-error{{tuple pattern cannot match values of the non-tuple type 'T'}}
       ()
 
-    case Twain(), // expected-error{{tuple pattern has the wrong length for tuple type '(T, T)'}}
-         Twain(_),
-         Twain(_, _),
-         Twain(_, _, _): // expected-error{{tuple pattern has the wrong length for tuple type '(T, T)'}}
+    case .Twain(), // expected-error{{tuple pattern has the wrong length for tuple type '(T, T)'}}
+         .Twain(_),
+         .Twain(_, _),
+         .Twain(_, _, _): // expected-error{{tuple pattern has the wrong length for tuple type '(T, T)'}}
       ()
     }
 
     switch foo {
-    case Naught: // expected-error{{enum case 'Naught' is not a member of type 'Foo'}}
+    case .Naught: // expected-error{{enum case 'Naught' not found in type 'Foo'}}
       ()
     case .A, .B, .C:
       ()
@@ -149,7 +149,7 @@ struct ContainsEnum {
     case Twain(T, T)
   }
 
-  func member(n: Possible<Int>) {
+  func member(_ n: Possible<Int>) {
     switch n {
     case ContainsEnum.Possible<Int>.Naught,
          ContainsEnum.Possible.Naught,
@@ -161,7 +161,7 @@ struct ContainsEnum {
   }
 }
 
-func nonmemberAccessesMemberType(n: ContainsEnum.Possible<Int>) {
+func nonmemberAccessesMemberType(_ n: ContainsEnum.Possible<Int>) {
   switch n {
   case ContainsEnum.Possible<Int>.Naught,
        .Naught:
@@ -272,7 +272,7 @@ case SG<T>(x: T()): // expected-error{{type 'SG<T>' of pattern does not match de
   ()
 }
 
-func sg_generic<B : Equatable>(sgb: SG<B>, b: B) {
+func sg_generic<B : Equatable>(_ sgb: SG<B>, b: B) {
   switch sgb {
   case SG(x: b):
     ()

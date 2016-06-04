@@ -30,15 +30,14 @@ ParameterList::create(const ASTContext &C, SourceLoc LParenLoc,
   assert(LParenLoc.isValid() == RParenLoc.isValid() &&
          "Either both paren locs are valid or neither are");
   
-  auto byteSize = sizeof(ParameterList)+params.size()*sizeof(ParamDecl*);
+  auto byteSize = totalSizeToAlloc<ParamDecl *>(params.size());
   auto rawMem = C.Allocate(byteSize, alignof(ParameterList));
   
   //  Placement initialize the ParameterList and the Parameter's.
   auto PL = ::new (rawMem) ParameterList(LParenLoc, params.size(), RParenLoc);
 
-  for (size_t i = 0, e = params.size(); i != e; ++i)
-    ::new (&PL->get(i)) ParamDecl*(params[i]);
-  
+  std::uninitialized_copy(params.begin(), params.end(), PL->getArray().begin());
+
   return PL;
 }
 
@@ -48,9 +47,27 @@ ParameterList::create(const ASTContext &C, SourceLoc LParenLoc,
 /// Note that this decl is created, but it is returned with an incorrect
 /// DeclContext that needs to be set correctly.  This is automatically handled
 /// when a function is created with this as part of its argument list.
+/// For a generic context, this also gives the parameter an unbound generic
+/// type with the expectation that type-checking will fill in the context
+/// generic parameters.
+ParameterList *ParameterList::createUnboundSelf(SourceLoc loc,
+                                                DeclContext *DC,
+                                                bool isStaticMethod,
+                                                bool isInOut) {
+  auto *PD = ParamDecl::createUnboundSelf(loc, DC, isStaticMethod, isInOut);
+  return create(DC->getASTContext(), PD);
+}
+
+/// Create an implicit 'self' decl for a method in the specified decl context.
+/// If 'static' is true, then this is self for a static method in the type.
 ///
-ParameterList *ParameterList::createSelf(SourceLoc loc, DeclContext *DC,
-                                         bool isStaticMethod, bool isInOut) {
+/// Note that this decl is created, but it is returned with an incorrect
+/// DeclContext that needs to be set correctly.  This is automatically handled
+/// when a function is created with this as part of its argument list.
+ParameterList *ParameterList::createSelf(SourceLoc loc,
+                                         DeclContext *DC,
+                                         bool isStaticMethod,
+                                         bool isInOut) {
   auto *PD = ParamDecl::createSelf(loc, DC, isStaticMethod, isInOut);
   return create(DC->getASTContext(), PD);
 }
@@ -61,8 +78,6 @@ void ParameterList::setDeclContextOfParamDecls(DeclContext *DC) {
   for (auto P : *this)
     P->setDeclContext(DC);
 }
-
-
 
 /// Make a duplicate copy of this parameter list.  This allocates copies of
 /// the ParamDecls, so they can be reparented into a new DeclContext.

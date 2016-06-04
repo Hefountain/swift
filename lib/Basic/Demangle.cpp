@@ -23,6 +23,7 @@
 #include "llvm/ADT/StringRef.h"
 #include <functional>
 #include <vector>
+#include <cstdio>
 #include <cstdlib>
 
 using namespace swift;
@@ -53,41 +54,38 @@ struct QuotedString {
 
   explicit QuotedString(std::string Value) : Value(Value) {}
 };
-  
-  
-  DemanglerPrinter &operator<<(DemanglerPrinter &printer,
-                               const QuotedString &QS) {
-    printer << '"';
-    for (auto C : QS.Value) {
-      switch (C) {
-      case '\\': printer << "\\\\"; break;
-      case '\t': printer << "\\t"; break;
-      case '\n': printer << "\\n"; break;
-      case '\r': printer << "\\r"; break;
-      case '"': printer << "\\\""; break;
-      case '\'': printer << '\''; break; // no need to escape these
-      case '\0': printer << "\\0"; break;
-      default:
-        auto c = static_cast<char>(C);
-        // Other ASCII control characters should get escaped.
-        if (c < 0x20 || c == 0x7F) {
-          static const char Hexdigit[] = {
-            '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-            'A', 'B', 'C', 'D', 'E', 'F'
-          };
-          printer << "\\x" << Hexdigit[c >> 4] << Hexdigit[c & 0xF];
-        } else {
-          printer << c;
-        }
-        break;
+} // end anonymous namespace.
+
+static DemanglerPrinter &operator<<(DemanglerPrinter &printer,
+                                    const QuotedString &QS) {
+  printer << '"';
+  for (auto C : QS.Value) {
+    switch (C) {
+    case '\\': printer << "\\\\"; break;
+    case '\t': printer << "\\t"; break;
+    case '\n': printer << "\\n"; break;
+    case '\r': printer << "\\r"; break;
+    case '"': printer << "\\\""; break;
+    case '\'': printer << '\''; break; // no need to escape these
+    case '\0': printer << "\\0"; break;
+    default:
+      auto c = static_cast<char>(C);
+      // Other ASCII control characters should get escaped.
+      if (c < 0x20 || c == 0x7F) {
+        static const char Hexdigit[] = {
+          '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+          'A', 'B', 'C', 'D', 'E', 'F'
+        };
+        printer << "\\x" << Hexdigit[c >> 4] << Hexdigit[c & 0xF];
+      } else {
+        printer << c;
       }
+      break;
     }
-    printer << '"';
-    return printer;
   }
-
-
-} // end unnamed namespace
+  printer << '"';
+  return printer;
+}
 
 Node::~Node() {
   switch (NodePayloadKind) {
@@ -152,15 +150,14 @@ static Node::Kind nominalTypeMarkerToNodeKind(char c) {
 
 static std::string archetypeName(Node::IndexType index,
                                  Node::IndexType depth) {
-  std::string str;
-  DemanglerPrinter name(str);
+  DemanglerPrinter name;
   do {
     name << (char)('A' + (index % 26));
     index /= 26;
   } while (index);
   if (depth != 0)
     name << depth;
-  return str;
+  return std::move(name).str();
 }
 
 namespace {
@@ -839,17 +836,34 @@ private:
 #undef FUNCSIGSPEC_CREATE_PARAM_PAYLOAD
 
   NodePointer demangleSpecializedAttribute() {
-    if (Mangled.nextIf("g")) {
-      auto spec = NodeFactory::create(Node::Kind::GenericSpecialization);
+    bool isNotReAbstracted = false;
+    if (Mangled.nextIf("g") || (isNotReAbstracted = Mangled.nextIf("r"))) {
+      auto spec = NodeFactory::create(isNotReAbstracted ?
+                              Node::Kind::GenericSpecializationNotReAbstracted :
+                              Node::Kind::GenericSpecialization);
+
+      // Create a node if the specialization is externally inlineable.
+      if (Mangled.nextIf("q")) {
+        auto kind = Node::Kind::SpecializationIsFragile;
+        spec->addChild(NodeFactory::create(kind));
+      }
+
       // Create a node for the pass id.
       spec->addChild(NodeFactory::create(Node::Kind::SpecializationPassID,
                                          unsigned(Mangled.next() - 48)));
+
       // And then mangle the generic specialization.
       return demangleGenericSpecialization(spec);
     }
     if (Mangled.nextIf("f")) {
       auto spec =
           NodeFactory::create(Node::Kind::FunctionSignatureSpecialization);
+
+      // Create a node if the specialization is externally inlineable.
+      if (Mangled.nextIf("q")) {
+        auto kind = Node::Kind::SpecializationIsFragile;
+        spec->addChild(NodeFactory::create(kind));
+      }
 
       // Add the pass id.
       spec->addChild(NodeFactory::create(Node::Kind::SpecializationPassID,
@@ -1365,12 +1379,11 @@ private:
   }
 
   NodePointer getDependentGenericParamType(unsigned depth, unsigned index) {
-    std::string Name;
-    DemanglerPrinter PrintName(Name);
+    DemanglerPrinter PrintName;
     PrintName << archetypeName(index, depth);
 
     auto paramTy = NodeFactory::create(Node::Kind::DependentGenericParamType,
-                                       std::move(Name));
+                                       std::move(PrintName).str());
     paramTy->addChild(NodeFactory::create(Node::Kind::Index, depth));
     paramTy->addChild(NodeFactory::create(Node::Kind::Index, index));
 
@@ -1501,8 +1514,11 @@ private:
     return nodeType;
   }
 
-  NodePointer demangleGenericSignature() {
-    auto sig = NodeFactory::create(Node::Kind::DependentGenericSignature);
+  NodePointer demangleGenericSignature(bool isPseudogeneric = false) {
+    auto sig =
+      NodeFactory::create(isPseudogeneric
+                            ? Node::Kind::DependentPseudogenericSignature
+                            : Node::Kind::DependentGenericSignature);
     // First read in the parameter counts at each depth.
     Node::IndexType count = ~(Node::IndexType)0;
     
@@ -1769,7 +1785,7 @@ private:
         if (demangleBuiltinSize(size)) {
           return NodeFactory::create(
               Node::Kind::BuiltinTypeName,
-              (DemanglerPrinter("") << "Builtin.Float" << size).str());
+              std::move(DemanglerPrinter() << "Builtin.Float" << size).str());
         }
       }
       if (c == 'i') {
@@ -1777,7 +1793,7 @@ private:
         if (demangleBuiltinSize(size)) {
           return NodeFactory::create(
               Node::Kind::BuiltinTypeName,
-              (DemanglerPrinter("") << "Builtin.Int" << size).str());
+              (DemanglerPrinter() << "Builtin.Int" << size).str());
         }
       }
       if (c == 'v') {
@@ -1791,7 +1807,7 @@ private:
               return nullptr;
             return NodeFactory::create(
                 Node::Kind::BuiltinTypeName,
-                (DemanglerPrinter("") << "Builtin.Vec" << elts << "xInt" << size)
+                (DemanglerPrinter() << "Builtin.Vec" << elts << "xInt" << size)
                     .str());
           }
           if (Mangled.nextIf('f')) {
@@ -1800,13 +1816,13 @@ private:
               return nullptr;
             return NodeFactory::create(
                 Node::Kind::BuiltinTypeName,
-                (DemanglerPrinter("") << "Builtin.Vec" << elts << "xFloat"
+                (DemanglerPrinter() << "Builtin.Vec" << elts << "xFloat"
                                     << size).str());
           }
           if (Mangled.nextIf('p'))
             return NodeFactory::create(
                 Node::Kind::BuiltinTypeName,
-                (DemanglerPrinter("") << "Builtin.Vec" << elts << "xRawPointer")
+                (DemanglerPrinter() << "Builtin.Vec" << elts << "xRawPointer")
                     .str());
         }
       }
@@ -2093,8 +2109,10 @@ private:
 
     // Enter a new generic context if this type is generic.
     // FIXME: replace with std::optional, when we have it.
-    if (Mangled.nextIf('G')) {
-      NodePointer generics = demangleGenericSignature();
+    bool isPseudogeneric = false;
+    if (Mangled.nextIf('G') ||
+        (isPseudogeneric = Mangled.nextIf('g'))) {
+      NodePointer generics = demangleGenericSignature(isPseudogeneric);
       if (!generics)
         return nullptr;
       type->addChild(generics);
@@ -2141,7 +2159,7 @@ private:
     auto Nothing = StringRef();
     CASE('a',   Nothing,                Nothing,         "@autoreleased")
     CASE('d',   "@callee_unowned",      "@unowned",      "@unowned")
-    CASE('d',   Nothing,                Nothing,         "@unowned_inner_pointer")
+    CASE('D',   Nothing,                Nothing,         "@unowned_inner_pointer")
     CASE('g',   "@callee_guaranteed",   "@guaranteed",   Nothing)
     CASE('e',   Nothing,                "@deallocating", Nothing)
     CASE('i',   Nothing,                "@in",           "@out")
@@ -2244,16 +2262,15 @@ swift::Demangle::demangleTypeAsNode(const char *MangledName,
 namespace {
 class NodePrinter {
 private:
-  std::string Str;
   DemanglerPrinter Printer;
   DemangleOptions Options;
   
 public:
-  NodePrinter(DemangleOptions options) : Printer(Str), Options(options) {}
+  NodePrinter(DemangleOptions options) : Options(options) {}
   
   std::string printRoot(NodePointer root) {
     print(root);
-    return Str;
+    return std::move(Printer).str();
   }
 
 private:  
@@ -2370,6 +2387,7 @@ private:
     case Node::Kind::DependentGenericParamCount:
     case Node::Kind::DependentGenericConformanceRequirement:
     case Node::Kind::DependentGenericSameTypeRequirement:
+    case Node::Kind::DependentPseudogenericSignature:
     case Node::Kind::Destructor:
     case Node::Kind::DidSet:
     case Node::Kind::DirectMethodReferenceAttribute:
@@ -2385,12 +2403,11 @@ private:
     case Node::Kind::FunctionSignatureSpecializationParamKind:
     case Node::Kind::FunctionSignatureSpecializationParamPayload:
     case Node::Kind::FunctionType:
-    case Node::Kind::Generics:
     case Node::Kind::GenericProtocolWitnessTable:
     case Node::Kind::GenericProtocolWitnessTableInstantiationFunction:
     case Node::Kind::GenericSpecialization:
+    case Node::Kind::GenericSpecializationNotReAbstracted:
     case Node::Kind::GenericSpecializationParam:
-    case Node::Kind::GenericType:
     case Node::Kind::GenericTypeMetadataPattern:
     case Node::Kind::Getter:
     case Node::Kind::Global:
@@ -2439,6 +2456,7 @@ private:
     case Node::Kind::ReabstractionThunk:
     case Node::Kind::ReabstractionThunkHelper:
     case Node::Kind::Setter:
+    case Node::Kind::SpecializationIsFragile:
     case Node::Kind::SpecializationPassID:
     case Node::Kind::Static:
     case Node::Kind::Subscript:
@@ -2769,8 +2787,7 @@ static bool useColonForEntityType(NodePointer entity, NodePointer type) {
   case Node::Kind::IVarDestroyer: {
     // We expect to see a function type here, but if we don't, use the colon.
     type = type->getChild(0);
-    while (type->getKind() == Node::Kind::GenericType ||
-           type->getKind() == Node::Kind::DependentGenericType)
+    while (type->getKind() == Node::Kind::DependentGenericType)
       type = type->getChild(1)->getChild(0);
     return (type->getKind() != Node::Kind::FunctionType &&
             type->getKind() != Node::Kind::UncurriedFunctionType &&
@@ -2808,8 +2825,7 @@ void NodePrinter::printSimplifiedEntityType(NodePointer context,
   type = type->getChild(0);
 
   NodePointer generics;
-  if (type->getKind() == Node::Kind::GenericType ||
-      type->getKind() == Node::Kind::DependentGenericType) {
+  if (type->getKind() == Node::Kind::DependentGenericType) {
     generics = type->getChild(0);
     type = type->getChild(1)->getChild(0);
   }
@@ -2879,13 +2895,12 @@ void NodePrinter::print(NodePointer pointer, bool asContext, bool suppressType) 
   case Node::Kind::ExplicitClosure:
   case Node::Kind::ImplicitClosure: {
     auto index = pointer->getChild(1)->getIndex();
-    std::string name;
-    DemanglerPrinter printName(name);
+    DemanglerPrinter printName;
     printName << '(';
     if (pointer->getKind() == Node::Kind::ImplicitClosure)
       printName << "implicit ";
     printName << "closure #" << (index + 1) << ")";
-    printEntity(false, false, name);
+    printEntity(false, false, std::move(printName).str());
     return;
   }
   case Node::Kind::Global:
@@ -2900,10 +2915,9 @@ void NodePrinter::print(NodePointer pointer, bool asContext, bool suppressType) 
     return;
   case Node::Kind::DefaultArgumentInitializer: {
     auto index = pointer->getChild(1);
-    std::string str;
-    DemanglerPrinter strPrinter(str);
+    DemanglerPrinter strPrinter;
     strPrinter << "(default argument " << index->getIndex() << ")";
-    printEntity(false, false, str);
+    printEntity(false, false, std::move(strPrinter).str());
     return;
   }
   case Node::Kind::DeclContext:
@@ -2928,9 +2942,13 @@ void NodePrinter::print(NodePointer pointer, bool asContext, bool suppressType) 
     Printer << " #" << (pointer->getChild(0)->getIndex() + 1) << ')';
     return;
   case Node::Kind::PrivateDeclName:
-    Printer << '(';
+    if (Options.ShowPrivateDiscriminators)
+      Printer << '(';
+
     print(pointer->getChild(1));
-    Printer << " in " << pointer->getChild(0)->getText() << ')';
+
+    if (Options.ShowPrivateDiscriminators)
+      Printer << " in " << pointer->getChild(0)->getText() << ')';
     return;
   case Node::Kind::Module:
     if (Options.DisplayModuleNames)
@@ -3038,23 +3056,38 @@ void NodePrinter::print(NodePointer pointer, bool asContext, bool suppressType) 
     Printer << "override ";
     return;
   case Node::Kind::FunctionSignatureSpecialization:
-  case Node::Kind::GenericSpecialization: {
+  case Node::Kind::GenericSpecialization:
+  case Node::Kind::GenericSpecializationNotReAbstracted: {
     if (!Options.DisplayGenericSpecializations) {
       Printer << "specialized ";
       return;
     }
     if (pointer->getKind() == Node::Kind::FunctionSignatureSpecialization) {
       Printer << "function signature specialization <";
-    } else {
+    } else if (pointer->getKind() == Node::Kind::GenericSpecialization) {
       Printer << "generic specialization <";
+    } else {
+      Printer << "generic not re-abstracted specialization <";
     }
     bool hasPrevious = false;
-    // We skip the 0 index since the SpecializationPassID does not contain any
-    // information that is useful to our users.
-    for (unsigned i = 1, e = pointer->getNumChildren(); i < e; ++i) {
-      // Ignore empty specializations.
-      if (!pointer->getChild(i)->hasChildren())
+    for (unsigned i = 0, e = pointer->getNumChildren(); i < e; ++i) {
+      auto child = pointer->getChild(i);
+
+      switch (pointer->getChild(i)->getKind()) {
+      case Node::Kind::SpecializationPassID:
+        // We skip the SpecializationPassID since it does not contain any
+        // information that is useful to our users.
         continue;
+
+      case Node::Kind::SpecializationIsFragile:
+        break;
+
+      default:
+        // Ignore empty specializations.
+        if (!pointer->getChild(i)->hasChildren())
+          continue;
+      }
+
       if (hasPrevious)
         Printer << ", ";
       print(pointer->getChild(i));
@@ -3063,6 +3096,9 @@ void NodePrinter::print(NodePointer pointer, bool asContext, bool suppressType) 
     Printer << "> of ";
     return;
   }
+  case Node::Kind::SpecializationIsFragile:
+    Printer << "preserving fragile attribute";
+    return;
   case Node::Kind::GenericSpecializationParam:
     print(pointer->getChild(0));
     for (unsigned i = 1, e = pointer->getNumChildren(); i < e; ++i) {
@@ -3400,20 +3436,6 @@ void NodePrinter::print(NodePointer pointer, bool asContext, bool suppressType) 
       Printer << ">";
     return;
   }
-  case Node::Kind::Generics: {
-    if (pointer->getNumChildren() == 0)
-      return;
-    Printer << "<";
-    print(pointer->getChild(0));
-    for (unsigned i = 1, e = pointer->getNumChildren(); i != e; ++i) {
-      auto child = pointer->getChild(i);
-      if (child->getKind() != Node::Kind::Archetype) break;
-      Printer << ", ";
-      print(child);
-    }
-    Printer << ">";
-    return;
-  }
   case Node::Kind::Archetype: {
     Printer << pointer->getText();
     if (pointer->hasChildren()) {
@@ -3437,13 +3459,6 @@ void NodePrinter::print(NodePointer pointer, bool asContext, bool suppressType) 
     Printer << "(archetype " << number->getIndex() << " of ";
     print(decl_ctx);
     Printer << ")";
-    return;
-  }
-  case Node::Kind::GenericType: {
-    NodePointer atype_list = pointer->getChild(0);
-    NodePointer fct_type = pointer->getChild(1)->getChild(0);
-    print(atype_list);
-    print(fct_type);
     return;
   }
   case Node::Kind::OwningAddressor:
@@ -3546,6 +3561,7 @@ void NodePrinter::print(NodePointer pointer, bool asContext, bool suppressType) 
     Printer << "<ERROR TYPE>";
     return;
       
+  case Node::Kind::DependentPseudogenericSignature:
   case Node::Kind::DependentGenericSignature: {
     Printer << '<';
     
@@ -3669,4 +3685,6 @@ std::string Demangle::demangleTypeAsString(const char *MangledName,
     return mangled.str();
   return demangling;
 }
+
+
 

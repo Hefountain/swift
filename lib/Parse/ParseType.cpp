@@ -292,13 +292,19 @@ ParserResult<IdentTypeRepr> Parser::parseTypeIdentifier() {
   if (Tok.isNot(tok::identifier) && Tok.isNot(tok::kw_Self)) {
     if (Tok.is(tok::code_complete)) {
       if (CodeCompletion)
-        CodeCompletion->completeTypeIdentifierWithDot(nullptr);
+        CodeCompletion->completeTypeSimpleBeginning();
       // Eat the code completion token because we handled it.
       consumeToken(tok::code_complete);
       return makeParserCodeCompletionResult<IdentTypeRepr>();
     }
 
     diagnose(Tok, diag::expected_identifier_for_type);
+
+    // If there is a keyword at the start of a new line, we won't want to
+    // skip it as a recovery but rather keep it.
+    if (Tok.isKeyword() && !Tok.isAtStartOfLine())
+      consumeToken();
+
     return nullptr;
   }
 
@@ -616,6 +622,9 @@ ParserResult<TypeRepr> Parser::parseTypeCollection() {
                        ? diag::expected_rbracket_dictionary_type
                        : diag::expected_rbracket_array_type, 
                      lsquareLoc);
+
+  if (firstTy.hasCodeCompletion() || secondTy.hasCodeCompletion())
+    return makeParserCodeCompletionStatus();
 
   // If we couldn't parse anything for one of the types, propagate the error.
   if (firstTy.isNull() || (colonLoc.isValid() && secondTy.isNull()))

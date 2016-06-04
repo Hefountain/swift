@@ -315,6 +315,7 @@ void Expr::propagateLValueAccessKind(AccessKind accessKind,
     NON_LVALUE_EXPR(DefaultValue)
     NON_LVALUE_EXPR(CodeCompletion)
     NON_LVALUE_EXPR(ObjCSelector)
+    NON_LVALUE_EXPR(ObjCKeyPath)
 
 #define UNCHECKED_EXPR(KIND, BASE) \
     NON_LVALUE_EXPR(KIND)
@@ -489,6 +490,7 @@ bool Expr::canAppendCallParentheses() const {
   case ExprKind::InterpolatedStringLiteral:
   case ExprKind::MagicIdentifierLiteral:
   case ExprKind::ObjCSelector:
+  case ExprKind::ObjCKeyPath:
     return true;
 
   case ExprKind::ObjectLiteral:
@@ -597,7 +599,11 @@ bool Expr::canAppendCallParentheses() const {
   case ExprKind::PointerToPointer:
   case ExprKind::LValueToPointer:
   case ExprKind::ForeignObjectConversion:
-    return false;
+  case ExprKind::UnevaluatedInstance:
+    // Implicit conversion nodes have no syntax of their own; defer to the
+    // subexpression.
+    return cast<ImplicitConversionExpr>(this)->getSubExpr()
+      ->canAppendCallParentheses();
 
   case ExprKind::ForcedCheckedCast:
   case ExprKind::ConditionalCheckedCast:
@@ -605,6 +611,7 @@ bool Expr::canAppendCallParentheses() const {
   case ExprKind::Coerce:
     return false;
 
+  case ExprKind::Arrow:
   case ExprKind::If:
   case ExprKind::Assign:
   case ExprKind::DefaultValue:
@@ -739,9 +746,8 @@ shallowCloneImpl(const MagicIdentifierLiteralExpr *E, ASTContext &Ctx) {
 
 static LiteralExpr *
 shallowCloneImpl(const ObjectLiteralExpr *E, ASTContext &Ctx) {
-  auto res = new (Ctx) ObjectLiteralExpr(E->getStartLoc(), E->getName(),
-                                         E->getNameLoc(), E->getArg(),
-                                         E->getEndLoc());
+  auto res = new (Ctx) ObjectLiteralExpr(E->getStartLoc(), E->getLiteralKind(),
+                                         E->getArg());
   res->setSemanticExpr(E->getSemanticExpr());
   return res;
 }
@@ -842,6 +848,22 @@ StringLiteralExpr::StringLiteralExpr(StringRef Val, SourceRange Range,
       unicode::isSingleExtendedGraphemeCluster(Val);
 }
 
+StringRef ObjectLiteralExpr::getLiteralKindRawName() const {
+  switch (LitKind) {
+#define POUND_OBJECT_LITERAL(Name, Desc, Proto) case Name: return #Name;
+#include "swift/Parse/Tokens.def"    
+  }
+  llvm_unreachable("unspecified literal");
+}
+
+StringRef ObjectLiteralExpr::getLiteralKindPlainName() const {
+  switch (LitKind) {
+#define POUND_OBJECT_LITERAL(Name, Desc, Proto) case Name: return Desc;
+#include "swift/Parse/Tokens.def"    
+  }
+  llvm_unreachable("unspecified literal");
+}
+
 void DeclRefExpr::setSpecialized() {
   if (isSpecialized())
     return;
@@ -934,19 +956,19 @@ TupleExpr::TupleExpr(SourceLoc LParenLoc, ArrayRef<Expr *> SubExprs,
          ElementNames.size() == ElementNameLocs.size());
 
   // Copy elements.
-  memcpy(getElements().data(), SubExprs.data(), 
-         SubExprs.size() * sizeof(Expr *));
+  std::uninitialized_copy(SubExprs.begin(), SubExprs.end(),
+                          getTrailingObjects<Expr *>());
 
   // Copy element names, if provided.
   if (hasElementNames()) {
-    memcpy(getElementNamesBuffer().data(), ElementNames.data(),
-           ElementNames.size() * sizeof(Identifier));
+    std::uninitialized_copy(ElementNames.begin(), ElementNames.end(),
+                            getTrailingObjects<Identifier>());
   }
 
   // Copy element name locations, if provided.
   if (hasElementNameLocs()) {
-    memcpy(getElementNameLocsBuffer().data(), ElementNameLocs.data(),
-           ElementNameLocs.size() * sizeof(SourceLoc));
+    std::uninitialized_copy(ElementNameLocs.begin(), ElementNameLocs.end(),
+                            getTrailingObjects<SourceLoc>());
   }
 }
 
@@ -957,10 +979,10 @@ TupleExpr *TupleExpr::create(ASTContext &ctx,
                              ArrayRef<SourceLoc> ElementNameLocs,
                              SourceLoc RParenLoc, bool HasTrailingClosure, 
                              bool Implicit, Type Ty) {
-  unsigned size = sizeof(TupleExpr);
-  size += SubExprs.size() * sizeof(Expr*);
-  size += ElementNames.size() * sizeof(Identifier);
-  size += ElementNameLocs.size() * sizeof(SourceLoc);
+  size_t size =
+      totalSizeToAlloc<Expr *, Identifier, SourceLoc>(SubExprs.size(),
+                                                      ElementNames.size(),
+                                                      ElementNameLocs.size());
   void *mem = ctx.Allocate(size, alignof(TupleExpr));
   return new (mem) TupleExpr(LParenLoc, SubExprs, ElementNames, ElementNameLocs,
                              RParenLoc, HasTrailingClosure, Implicit, Ty);
@@ -1205,4 +1227,44 @@ ArchetypeType *OpenExistentialExpr::getOpenedArchetype() const {
   while (auto metaTy = type->getAs<MetatypeType>())
     type = metaTy->getInstanceType();
   return type->castTo<ArchetypeType>();
+}
+
+ObjCKeyPathExpr::ObjCKeyPathExpr(SourceLoc keywordLoc, SourceLoc lParenLoc,
+                         ArrayRef<Identifier> names,
+                         ArrayRef<SourceLoc> nameLocs,
+                         SourceLoc rParenLoc)
+  : Expr(ExprKind::ObjCKeyPath, /*Implicit=*/nameLocs.empty()),
+    KeywordLoc(keywordLoc), LParenLoc(lParenLoc), RParenLoc(rParenLoc)
+{
+  // Copy components (which are all names).
+  ObjCKeyPathExprBits.NumComponents = names.size();
+  for (auto idx : indices(names))
+    getComponentsMutable()[idx] = names[idx];
+
+  assert(nameLocs.empty() || nameLocs.size() == names.size());
+  ObjCKeyPathExprBits.HaveSourceLocations = !nameLocs.empty();
+  if (ObjCKeyPathExprBits.HaveSourceLocations) {
+    memcpy(getNameLocsMutable().data(), nameLocs.data(),
+           nameLocs.size() * sizeof(SourceLoc));
+  }
+}
+
+Identifier ObjCKeyPathExpr::getComponentName(unsigned i) const {
+  if (auto decl = getComponentDecl(i))
+    return decl->getFullName().getBaseName();
+
+  return getComponents()[i].get<Identifier>();
+}
+
+ObjCKeyPathExpr *ObjCKeyPathExpr::create(ASTContext &ctx,
+                                 SourceLoc keywordLoc, SourceLoc lParenLoc,
+                                 ArrayRef<Identifier> names,
+                                 ArrayRef<SourceLoc> nameLocs,
+                                 SourceLoc rParenLoc) {
+  unsigned size = sizeof(ObjCKeyPathExpr)
+    + names.size() * sizeof(Identifier)
+    + nameLocs.size() * sizeof(SourceLoc);
+  void *mem = ctx.Allocate(size, alignof(ObjCKeyPathExpr));
+  return new (mem) ObjCKeyPathExpr(keywordLoc, lParenLoc, names, nameLocs,
+                                   rParenLoc);
 }

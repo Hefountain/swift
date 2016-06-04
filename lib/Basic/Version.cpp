@@ -168,7 +168,7 @@ Version Version::parseCompilerVersionString(
       Diags->diagnose(Range.Start,
                       diag::version_component_not_number);
     } else {
-      llvm_unreachable("Invalid character in _compiler_version build configuration");
+      llvm_unreachable("Invalid character in _compiler_version condition");
     }
   }
 
@@ -241,7 +241,7 @@ Version Version::getCurrentCompilerVersion() {
          "Embedded Swift language version couldn't be parsed: '"
          SWIFT_COMPILER_VERSION
          "'");
-  return currentVersion;
+  return currentVersion.getValue();
 #else
   return Version();
 #endif
@@ -260,15 +260,13 @@ Version Version::getCurrentLanguageVersion() {
   return currentVersion.getValue();
 }
 
-std::string Version::str() const {
-  std::string VersionString;
-  llvm::raw_string_ostream OS(VersionString);
-  for (auto i = Components.begin(); i != Components.end(); i++) {
-    OS << *i;
-    if (i != Components.end() - 1)
-      OS << '.';
-  }
-  return OS.str();
+raw_ostream &operator<<(raw_ostream &os, const Version &version) {
+  if (version.empty())
+    return os;
+  os << version[0];
+  for (size_t i = 1, e = version.size(); i != e; ++i)
+    os << '.' << version[i];
+  return os;
 }
 
 std::string Version::preprocessorDefinition() const {

@@ -9,7 +9,7 @@ import Swift
 //
 // CHECK: sil_witness_table public_external [fragile] X: P module Swift {
 
-func doSomething<T : P>(t : T) -> Y {
+func doSomething<T : P>(_ t : T) -> Y {
   return t.doSomething()
 }
 
@@ -17,3 +17,6 @@ func done() -> Y {
   let x = X()
   return doSomething(x)
 }
+
+// Make sure dead function elimination does not get rid of done and doSomething.
+done()

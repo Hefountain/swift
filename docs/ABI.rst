@@ -907,8 +907,8 @@ Types
   type ::= 'BB'                              // Builtin.UnsafeValueBuffer
   type ::= 'Bf' natural '_'                  // Builtin.Float<n>
   type ::= 'Bi' natural '_'                  // Builtin.Int<n>
-  type ::= 'BO'                              // Builtin.ObjCPointer
-  type ::= 'Bo'                              // Builtin.ObjectPointer
+  type ::= 'BO'                              // Builtin.UnknownObject
+  type ::= 'Bo'                              // Builtin.NativeObject
   type ::= 'Bp'                              // Builtin.RawPointer
   type ::= 'Bv' natural type                 // Builtin.Vec<n>x<type>
   type ::= 'Bw'                              // Builtin.Word
@@ -935,6 +935,7 @@ Types
   type ::= 'Xw' type                         // @weak type
   type ::= 'XF' impl-function-type           // function implementation type
   type ::= 'Xf' type type                    // @thin function type
+  type ::= 'Xb' type                         // SIL @box type
   nominal-type ::= known-nominal-type
   nominal-type ::= substitution
   nominal-type ::= nominal-type-kind declaration-name
@@ -1015,6 +1016,7 @@ mangled in to disambiguate.
   impl-function-attribute ::= 'Cw'            // compatible with protocol witness
   impl-function-attribute ::= 'N'             // noreturn
   impl-function-attribute ::= 'G'             // generic
+  impl-function-attribute ::= 'g'             // pseudogeneric
   impl-parameter ::= impl-convention type
   impl-result ::= impl-convention type
 
@@ -1024,7 +1026,8 @@ implementation details of a function type.
 
 Any ``<impl-function-attribute>`` productions must appear in the order
 in which they are specified above: e.g. a noreturn C function is
-mangled with ``CcN``.
+mangled with ``CcN``.  ``g`` and ``G`` are exclusive and mark the presence
+of a generic signature immediately following.
 
 Note that the convention and function-attribute productions do not
 need to be disambiguated from the start of a ``<type>``.
@@ -1039,6 +1042,14 @@ Generics
 ``<protocol-conformance>`` refers to a type's conformance to a protocol. The
 named module is the one containing the extension or type declaration that
 declared the conformance.
+
+::
+
+  // Property behavior conformance
+  protocol-conformance ::= ('u' generic-signature)?
+                           'b' identifier context identifier protocol
+
+Property behaviors are implemented using private protocol conformances.
 
 ::
 
@@ -1169,7 +1180,7 @@ associated substitution index. Otherwise, the entity is mangled normally, and
 it is then added to the substitution map and associated with the next
 available substitution index.
 
-For example,  in mangling a function type
+For example, in mangling a function type
 ``(zim.zang.zung, zim.zang.zung, zim.zippity) -> zim.zang.zoo`` (with module
 ``zim`` and class ``zim.zang``),
 the recurring contexts ``zim``, ``zim.zang``, and ``zim.zang.zung``

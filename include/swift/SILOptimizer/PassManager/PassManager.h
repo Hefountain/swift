@@ -65,6 +65,10 @@ class SILPassManager {
   /// Set to true when a pass invalidates an analysis.
   bool CurrentPassHasInvalidated = false;
 
+  /// True if we need to stop running passes and restart again on the
+  /// same function.
+  bool RestartPipeline = false;
+
 public:
   /// C'tor. It creates and registers all analysis passes, which are defined
   /// in Analysis.def.
@@ -99,6 +103,12 @@ public:
     FunctionWorklist.push_back(F);
   }
 
+  /// \brief Restart the function pass pipeline on the same function
+  /// that is currently being processed.
+  void restartWithCurrentFunction(SILTransform *T);
+  void clearRestartPipeline() { RestartPipeline = false; }
+  bool shouldRestartPipeline() { return RestartPipeline; }
+
   ///  \brief Broadcast the invalidation of the module to all analysis.
   void invalidateAnalysis(SILAnalysis::InvalidationKind K) {
     assert(K != SILAnalysis::InvalidationKind::Nothing &&
@@ -114,6 +124,20 @@ public:
     CompletedPassesMap.clear();
   }
 
+  /// \brief Add the function to the function pass worklist.
+  void notifyTransformationOfFunction(SILFunction *F) {
+    addFunctionToWorklist(F);
+  }
+
+  /// \brief Iterate over all analysis and notify them of the function.
+  /// This function does not necessarily have to be newly created function. It
+  /// is the job of the analysis to make sure no extra work is done if the
+  /// particular analysis has been done on the function.
+  void notifyAnalysisOfFunction(SILFunction *F) {
+    for (auto AP : Analysis)
+      AP->notifyAnalysisOfFunction(F);
+  }
+
   /// \brief Broadcast the invalidation of the function to all analysis.
   void invalidateAnalysis(SILFunction *F,
                           SILAnalysis::InvalidationKind K) {
@@ -121,6 +145,21 @@ public:
     for (auto AP : Analysis)
       if (!AP->isLocked())
         AP->invalidate(F, K);
+    
+    CurrentPassHasInvalidated = true;
+    // Any change let all passes run again.
+    CompletedPassesMap[F].reset();
+  }
+
+  /// \brief Broadcast the invalidation of the function to all analysis.
+  /// And we also know this function is dead and will be removed from the
+  /// module.
+  void invalidateAnalysisForDeadFunction(SILFunction *F,
+                                         SILAnalysis::InvalidationKind K) {
+    // Invalidate the analysis (unless they are locked)
+    for (auto AP : Analysis)
+      if (!AP->isLocked())
+        AP->invalidateForDeadFunction(F, K);
     
     CurrentPassHasInvalidated = true;
     // Any change let all passes run again.
@@ -173,7 +212,8 @@ private:
   void runModulePass(SILModuleTransform *SMT);
 
   /// Run the passes in \p FuncTransforms on the function \p F.
-  void runPassesOnFunction(PassList FuncTransforms, SILFunction *F);
+  void runPassesOnFunction(PassList FuncTransforms, SILFunction *F,
+                           bool runToCompletion);
 
   /// Run the passes in \p FuncTransforms. Return true
   /// if the pass manager requested to stop the execution
@@ -183,6 +223,9 @@ private:
   /// A helper function that returns (based on SIL stage and debug
   /// options) whether we should continue running passes.
   bool continueTransforming();
+
+  /// Return true if all analyses are unlocked.
+  bool analysesUnlocked();
 
   /// Displays the call graph in an external dot-viewer.
   /// This function is meant for use from the debugger.

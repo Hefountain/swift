@@ -13,11 +13,11 @@ func test() {
 // CHECK-NEXT:   key.sourcetext: "abs(<#T##x: T##T#>)",
 // CHECK-NEXT:   key.description: "abs(x: T)",
 // CHECK-NEXT:   key.typename: "T",
-// CHECK-NEXT:   key.doc.brief: "Return the absolute value of x.",
+// CHECK-NEXT:   key.doc.brief: "Returns the absolute value of x.",
 // CHECK-NEXT:   key.context: source.codecompletion.context.othermodule,
 // CHECK-NEXT:   key.moduleimportdepth: 1,
 // CHECK-NEXT:   key.num_bytes_to_erase: 0,
-// CHECK:   key.associated_usrs: "s:Fs3absuRxs16SignedNumberTyperFxx",
+// CHECK:   key.associated_usrs: "s:Fs3absuRxs12SignedNumberrFxx",
 // CHECK-NEXT:   key.modulename: "Swift"
 // CHECK-NEXT: },
 

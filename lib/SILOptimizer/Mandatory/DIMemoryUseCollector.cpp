@@ -311,13 +311,22 @@ bool DIMemoryUse::
 onlyTouchesTrivialElements(const DIMemoryObjectInfo &MI) const {
   auto &Module = Inst->getModule();
   
-  for (unsigned i = FirstElement, e = i+NumElements; i != e; ++i){
+  for (unsigned i = FirstElement, e = i+NumElements; i != e; ++i) {
     // Skip 'super.init' bit
     if (i == MI.getNumMemoryElements())
       return false;
 
     auto EltTy = MI.getElementType(i);
-    if (!SILType::getPrimitiveObjectType(EltTy).isTrivial(Module))
+
+    auto SILEltTy = EltTy;
+    // We are getting the element type from a compound type. This might not be a
+    // legal SIL type. Lower the type if it is not a legal type.
+    if (!SILEltTy->isLegalSILType())
+      SILEltTy = MI.MemoryInst->getModule()
+                     .Types.getLoweredType(EltTy, 0)
+                     .getSwiftRValueType();
+
+    if (!SILType::getPrimitiveObjectType(SILEltTy).isTrivial(Module))
       return false;
   }
   return true;
@@ -695,6 +704,19 @@ void ElementUseCollector::collectUses(SILValue Pointer, unsigned BaseEltNo) {
       auto FTI = Apply->getSubstCalleeType();
       unsigned ArgumentNumber = UI->getOperandNumber()-1;
 
+      // If this is an out-parameter, it is like a store.
+      unsigned NumIndirectResults = FTI->getNumIndirectResults();
+      if (ArgumentNumber < NumIndirectResults) {
+        assert(!InStructSubElement && "We're initializing sub-members?");
+        addElementUses(BaseEltNo, PointeeType, User,
+                       DIUseKind::Initialization);
+        continue;
+
+      // Otherwise, adjust the argument index.      
+      } else {
+        ArgumentNumber -= NumIndirectResults;
+      }
+
       auto ParamConvention = FTI->getParameters()[ArgumentNumber]
         .getConvention();
 
@@ -709,13 +731,6 @@ void ElementUseCollector::collectUses(SILValue Pointer, unsigned BaseEltNo) {
       case ParameterConvention::Indirect_In:
       case ParameterConvention::Indirect_In_Guaranteed:
         addElementUses(BaseEltNo, PointeeType, User, DIUseKind::IndirectIn);
-        continue;
-
-      // If this is an out-parameter, it is like a store.
-      case ParameterConvention::Indirect_Out:
-        assert(!InStructSubElement && "We're initializing sub-members?");
-        addElementUses(BaseEltNo, PointeeType, User,
-                       DIUseKind::Initialization);
         continue;
 
       // If this is an @inout parameter, it is like both a load and store.
@@ -1016,8 +1031,8 @@ static SILInstruction *isSuperInitUse(UpcastInst *Inst) {
       // If we're reading a .sil file, treat a call to "superinit" as a
       // super.init call as a hack to allow us to write testcases.
       auto *AI = dyn_cast<ApplyInst>(inst);
-      if (AI && inst->getLoc().is<SILFileLocation>())
-        if (auto *Fn = AI->getCalleeFunction())
+      if (AI && inst->getLoc().isSILFile())
+        if (auto *Fn = AI->getReferencedFunction())
           if (Fn->getName() == "superinit")
             return inst;
       continue;
@@ -1055,9 +1070,9 @@ static SILInstruction *isSuperInitUse(UpcastInst *Inst) {
 static bool isSelfInitUse(SILInstruction *I) {
   // If we're reading a .sil file, treat a call to "selfinit" as a
   // self.init call as a hack to allow us to write testcases.
-  if (I->getLoc().is<SILFileLocation>()) {
+  if (I->getLoc().isSILFile()) {
     if (auto *AI = dyn_cast<ApplyInst>(I))
-      if (auto *Fn = AI->getCalleeFunction())
+      if (auto *Fn = AI->getReferencedFunction())
         if (Fn->getName().startswith("selfinit"))
           return true;
     
@@ -1264,11 +1279,23 @@ void ElementUseCollector::collectDelegatingClassInitSelfUses() {
     if (isa<StoreInst>(User) && UI->getOperandNumber() == 1)
       continue;
 
-    // For class initializers, the assign into the self box is captured as
-    // a SelfInit or SuperInit elsewhere.
+    // For class initializers, the assign into the self box may be
+    // captured as SelfInit or SuperInit elsewhere.
     if (TheMemory.isClassInitSelf() &&
-        isa<AssignInst>(User) && UI->getOperandNumber() == 1)
+        isa<AssignInst>(User) && UI->getOperandNumber() == 1) {
+      // If the source of the assignment is an application of a C
+      // function, there is no metatype argument, so treat the
+      // assignment to the self box as the initialization.
+      if (auto apply = dyn_cast<ApplyInst>(cast<AssignInst>(User)->getSrc())) {
+        if (auto fn = apply->getCalleeFunction()) {
+          if (fn->getRepresentation()
+                == SILFunctionTypeRepresentation::CFunctionPointer)
+            Uses.push_back(DIMemoryUse(User, DIUseKind::SelfInit, 0, 1));
+        }
+      }
+
       continue;
+    }
 
     // Stores *to* the allocation are writes.  If the value being stored is a
     // call to self.init()... then we have a self.init call.

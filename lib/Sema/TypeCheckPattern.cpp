@@ -17,7 +17,7 @@
 
 #include "TypeChecker.h"
 #include "GenericTypeResolver.h"
-#include "swift/AST/Attr.h"
+#include "swift/Basic/StringExtras.h"
 #include "swift/AST/ExprHandle.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/ASTVisitor.h"
@@ -32,7 +32,10 @@ using namespace swift;
 /// This requires the getter's body to have a certain syntactic form. It should
 /// be kept in sync with importEnumCaseAlias in the ClangImporter library.
 static EnumElementDecl *
-extractEnumElement(const VarDecl *constant) {
+extractEnumElement(TypeChecker &TC, DeclContext *DC, SourceLoc UseLoc,
+                   const VarDecl *constant) {
+  TC.diagnoseExplicitUnavailability(constant, UseLoc, DC, nullptr);
+
   const FuncDecl *getter = constant->getGetter();
   if (!getter)
     return nullptr;
@@ -62,7 +65,8 @@ extractEnumElement(const VarDecl *constant) {
 /// If there are no enum elements but there are properties, attempts to map
 /// an arbitrary property to an enum element using extractEnumElement.
 static EnumElementDecl *
-filterForEnumElement(LookupResult foundElements) {
+filterForEnumElement(TypeChecker &TC, DeclContext *DC, SourceLoc UseLoc,
+                     LookupResult foundElements) {
   EnumElementDecl *foundElement = nullptr;
   VarDecl *foundConstant = nullptr;
 
@@ -86,7 +90,7 @@ filterForEnumElement(LookupResult foundElements) {
   }
 
   if (!foundElement && foundConstant && foundConstant->hasClangNode())
-    foundElement = extractEnumElement(foundConstant);
+    foundElement = extractEnumElement(TC, DC, UseLoc, foundConstant);
 
   return foundElement;
 }
@@ -94,24 +98,24 @@ filterForEnumElement(LookupResult foundElements) {
 /// Find an unqualified enum element.
 static EnumElementDecl *
 lookupUnqualifiedEnumMemberElement(TypeChecker &TC, DeclContext *DC,
-                                   Identifier name) {
+                                   Identifier name, SourceLoc UseLoc) {
   auto lookupOptions = defaultUnqualifiedLookupOptions;
   lookupOptions |= NameLookupFlags::KnownPrivate;
   auto lookup = TC.lookupUnqualified(DC, name, SourceLoc(), lookupOptions);
-  return filterForEnumElement(lookup);
+  return filterForEnumElement(TC, DC, UseLoc, lookup);
 }
 
 /// Find an enum element in an enum type.
 static EnumElementDecl *
 lookupEnumMemberElement(TypeChecker &TC, DeclContext *DC, Type ty,
-                        Identifier name) {
+                        Identifier name, SourceLoc UseLoc) {
   assert(ty->getAnyNominal());
   // Look up the case inside the enum.
   // FIXME: We should be able to tell if this is a private lookup.
   NameLookupOptions lookupOptions
     = defaultMemberLookupOptions - NameLookupFlags::DynamicLookup;
   LookupResult foundElements = TC.lookupMember(DC, ty, name, lookupOptions);
-  return filterForEnumElement(foundElements);
+  return filterForEnumElement(TC, DC, UseLoc, foundElements);
 }
 
 namespace {
@@ -436,7 +440,8 @@ public:
 
     // FIXME: Argument labels?
     EnumElementDecl *referencedElement
-      = lookupEnumMemberElement(TC, DC, ty, ude->getName().getBaseName());
+      = lookupEnumMemberElement(TC, DC, ty, ude->getName().getBaseName(),
+                                ude->getLoc());
     
     // Build a TypeRepr from the head of the full path.
     // FIXME: Compound names.
@@ -474,7 +479,8 @@ public:
     // Try looking up an enum element in context.
     if (EnumElementDecl *referencedElement
         = lookupUnqualifiedEnumMemberElement(TC, DC,
-                                             ude->getName().getBaseName())) {
+                                             ude->getName().getBaseName(),
+                                             ude->getLoc())) {
       auto *enumDecl = referencedElement->getParentEnum();
       auto enumTy = enumDecl->getDeclaredTypeInContext();
       TypeLoc loc = TypeLoc::withoutLoc(enumTy);
@@ -558,7 +564,8 @@ public:
     if (auto compId = dyn_cast<ComponentIdentTypeRepr>(repr)) {
       // Try looking up an enum element in context.
       EnumElementDecl *referencedElement
-        = lookupUnqualifiedEnumMemberElement(TC, DC, compId->getIdentifier());
+        = lookupUnqualifiedEnumMemberElement(TC, DC, compId->getIdentifier(),
+                                             repr->getLoc());
       
       if (!referencedElement)
         return nullptr;
@@ -596,7 +603,8 @@ public:
     auto tailComponent = compoundR->Components.back();
 
     EnumElementDecl *referencedElement
-      = lookupEnumMemberElement(TC, DC, enumTy, tailComponent->getIdentifier());
+      = lookupEnumMemberElement(TC, DC, enumTy, tailComponent->getIdentifier(),
+                                tailComponent->getLoc());
     if (!referencedElement)
       return nullptr;
     
@@ -712,6 +720,73 @@ static bool validateTypedPattern(TypeChecker &TC, DeclContext *DC,
   return hadError;
 }
 
+static void diagnoseAndMigrateVarParameterToBody(ParamDecl *decl,
+                                                 AbstractFunctionDecl *func,
+                                                 TypeChecker &TC) {
+  if (!func || !func->hasBody()) {
+    // If there is no function body, just suggest removal.
+    TC.diagnose(decl->getLetVarInOutLoc(),
+                diag::var_parameter_not_allowed)
+      .fixItRemove(decl->getLetVarInOutLoc());
+    return;
+  }
+  // Insert the shadow copy. The computations that follow attempt to
+  // 'best guess' the indentation and new lines so that the user
+  // doesn't have to add any whitespace.
+  auto declBody = func->getBody();
+  
+  auto &SM = TC.Context.SourceMgr;
+  
+  SourceLoc insertionStartLoc;
+  std::string start;
+  std::string end;
+  
+  auto lBraceLine = SM.getLineNumber(declBody->getLBraceLoc());
+  auto rBraceLine = SM.getLineNumber(declBody->getRBraceLoc());
+
+  if (!declBody->getNumElements()) {
+    
+    // Empty function body.
+    insertionStartLoc = declBody->getRBraceLoc();
+    
+    if (lBraceLine == rBraceLine) {
+      // Same line braces, means we probably have something
+      // like {} as the func body. Insert directly into body with spaces.
+      start = " ";
+      end = " ";
+    } else {
+      // Different line braces, so use RBrace's indentation.
+      end = "\n" + Lexer::getIndentationForLine(SM, declBody->
+                                                getRBraceLoc()).str();
+      start = "    "; // Guess 4 spaces as extra indentation.
+    }
+  } else {
+    auto firstLine = declBody->getElement(0);
+    insertionStartLoc = firstLine.getStartLoc();
+    if (lBraceLine == SM.getLineNumber(firstLine.getStartLoc())) {
+      // Function on same line, insert with semi-colon. Not ideal but
+      // better than weird space alignment.
+      start = "";
+      end = "; ";
+    } else {
+      start = "";
+      end = "\n" + Lexer::getIndentationForLine(SM, firstLine.
+                                                getStartLoc()).str();
+    }
+  }
+  if (insertionStartLoc.isInvalid()) {
+    TC.diagnose(decl->getLetVarInOutLoc(),
+                diag::var_parameter_not_allowed)
+    .fixItRemove(decl->getLetVarInOutLoc());
+    return;
+  }
+  auto parameterName = decl->getNameStr().str();
+  TC.diagnose(decl->getLetVarInOutLoc(),
+              diag::var_parameter_not_allowed)
+  .fixItRemove(decl->getLetVarInOutLoc())
+  .fixItInsert(insertionStartLoc, start + "var " + parameterName + " = " +
+               parameterName + end);
+}
 
 static bool validateParameterType(ParamDecl *decl, DeclContext *DC,
                                   TypeResolutionOptions options,
@@ -736,6 +811,15 @@ static bool validateParameterType(ParamDecl *decl, DeclContext *DC,
       }
     }
     decl->getTypeLoc().setType(Ty);
+  }
+  // If the param is not a 'let' and it is not an 'inout'.
+  // It must be a 'var'. Provide helpful diagnostics like a shadow copy
+  // in the function body to fix the 'var' attribute.
+  if (!decl->isLet() && !Ty->is<InOutType>()) {
+    auto func = dyn_cast_or_null<AbstractFunctionDecl>(DC);
+    diagnoseAndMigrateVarParameterToBody(decl, func, TC);
+    decl->setInvalid();
+    hadError = true;
   }
 
   if (hadError)
@@ -868,7 +952,7 @@ bool TypeChecker::typeCheckPattern(Pattern *P, DeclContext *dc,
     for (unsigned i = 0, e = tuplePat->getNumElements(); i != e; ++i) {
       TuplePatternElt &elt = tuplePat->getElement(i);
       Pattern *pattern = elt.getPattern();
-      if (typeCheckPattern(pattern, dc, elementOptions, resolver)){
+      if (typeCheckPattern(pattern, dc, elementOptions, resolver)) {
         hadError = true;
         continue;
       }
@@ -1214,6 +1298,12 @@ bool TypeChecker::coercePatternToType(Pattern *&P, DeclContext *dc, Type type,
 
     auto castType = IP->getCastTypeLoc().getType();
 
+    if (auto bridgedNSErrorProtocol =
+            Context.getProtocol(KnownProtocolKind::BridgedNSError)) {
+      conformsToProtocol(castType, bridgedNSErrorProtocol, dc,
+                         ConformanceCheckFlags::Used);
+    }
+
     // Determine whether we have an imbalance in the number of optionals.
     SmallVector<Type, 2> inputTypeOptionals;
     type->lookThroughAllAnyOptionalTypes(inputTypeOptionals);
@@ -1229,7 +1319,7 @@ bool TypeChecker::coercePatternToType(Pattern *&P, DeclContext *dc, Type type,
         sub = new (Context) EnumElementPattern(TypeLoc(),
                                                IP->getStartLoc(),
                                                IP->getEndLoc(),
-                                               Context.Id_Some,
+                                               Context.Id_some,
                                                nullptr, sub,
                                                /*Implicit=*/true);
       }
@@ -1300,12 +1390,34 @@ bool TypeChecker::coercePatternToType(Pattern *&P, DeclContext *dc, Type type,
     
     Type enumTy;
     if (!elt) {
-      if (type->getAnyNominal())
-        elt = lookupEnumMemberElement(*this, dc, type, EEP->getName());
+      if (type->getAnyNominal()) {
+        elt = lookupEnumMemberElement(*this, dc, type, EEP->getName(),
+                                      EEP->getLoc());
+      }
       if (!elt) {
-        if (!type->is<ErrorType>())
+        if (!type->is<ErrorType>()) {
+          // Lowercasing of Swift.Optional's cases is handled in the
+          // standard library itself, not through the clang importer,
+          // so we have to do this check here. Additionally, .Some
+          // isn't a static VarDecl, so the existing mechanics in
+          // extractEnumElement won't work.
+          if (type->getAnyNominal() == Context.getOptionalDecl()) {
+            if (EEP->getName().str() == "None" ||
+                EEP->getName().str() == "Some") {
+              SmallString<4> Rename;
+              camel_case::toLowercaseWord(EEP->getName().str(), Rename);
+              diagnose(EEP->getLoc(), diag::availability_decl_unavailable_rename,
+                          EEP->getName(), /*replaced*/false,
+                          /*special kind*/0, Rename.str())
+                .fixItReplace(EEP->getLoc(), Rename.str());
+
+            }
+            return true;
+          }
+
           diagnose(EEP->getLoc(), diag::enum_element_pattern_member_not_found,
                    EEP->getName().str(), type);
+        }
         return true;
       }
       enumTy = type;
@@ -1411,7 +1523,8 @@ bool TypeChecker::coercePatternToType(Pattern *&P, DeclContext *dc, Type type,
     // If the element decl was not resolved (because it was spelled without a
     // type as `.Foo`), resolve it now that we have a type.
     if (!OP->getElementDecl()) {
-      auto *element = lookupEnumMemberElement(*this, dc, type, Context.Id_Some);
+      auto *element = lookupEnumMemberElement(*this, dc, type, Context.Id_some,
+                                              OP->getLoc());
       if (!element) {
         diagnose(OP->getLoc(), diag::enum_element_pattern_member_not_found,
                  "Some", type);
@@ -1494,7 +1607,7 @@ bool TypeChecker::coercePatternToType(Pattern *&P, DeclContext *dc, Type type,
           continue;
         VarDecl *prop = nullptr;
         SmallVector<ValueDecl *, 4> members;
-        unsigned lookupOptions =
+        NLOptions lookupOptions =
             NL_QualifiedDefault | NL_KnownNonCascadingDependency;
         if (!dc->lookupQualified(type, elt.getPropertyName(),
                                  lookupOptions, this, members)) {
@@ -1578,6 +1691,15 @@ bool TypeChecker::coerceParameterListToType(ParameterList *P, DeclContext *DC,
           !ty->is<ErrorType>())
         param->overwriteType(ty);
     }
+
+    if (!ty->isMaterializable()) {
+      if (ty->is<InOutType>()) {
+        param->setLet(false);
+      } else if (param->hasName()) {
+        diagnose(param->getStartLoc(),
+                 diag::param_type_non_materializable_tuple, ty);
+      }
+    }
     
     if (param->isInvalid())
       param->overwriteType(ErrorType::get(Context));
@@ -1585,8 +1707,6 @@ bool TypeChecker::coerceParameterListToType(ParameterList *P, DeclContext *DC,
       param->overwriteType(ty);
     
     checkTypeModifyingDeclAttributes(param);
-    if (ty->is<InOutType>())
-      param->setLet(false);
     return hadError;
   };
 

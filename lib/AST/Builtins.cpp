@@ -159,10 +159,15 @@ getBuiltinFunction(Identifier Id, ArrayRef<Type> argTypes, Type ResType,
   auto *paramList = ParameterList::create(Context, params);
   
   DeclName Name(Context, Id, paramList);
-  auto FD = FuncDecl::create(Context, SourceLoc(), StaticSpellingKind::None,
-                          SourceLoc(), Name, SourceLoc(), SourceLoc(),
-                          SourceLoc(), /*GenericParams=*/nullptr, FnType,
-                          paramList, TypeLoc::withoutLoc(ResType), DC);
+  auto FD = FuncDecl::create(Context, /*StaticLoc=*/SourceLoc(),
+                             StaticSpellingKind::None,
+                             /*FuncLoc=*/SourceLoc(),
+                             Name, /*NameLoc=*/SourceLoc(),
+                             /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
+                             /*AccessorKeywordLoc=*/SourceLoc(),
+                             /*GenericParams=*/nullptr,
+                             paramList, FnType,
+                             TypeLoc::withoutLoc(ResType), DC);
   FD->setImplicit();
   FD->setAccessibility(Accessibility::Public);
   return FD;
@@ -194,7 +199,6 @@ getBuiltinGenericFunction(Identifier Id,
     requirements.push_back(Requirement(RequirementKind::WitnessMarker,
                                        param, Type()));
   }
-  
   GenericSignature *Sig = GenericSignature::get(GenericParamTypes,requirements);
   
   Type InterfaceType = GenericFunctionType::get(Sig,
@@ -221,10 +225,13 @@ getBuiltinGenericFunction(Identifier Id,
                                              ResBodyType, GenericParams, Info);
   
   DeclName Name(Context, Id, paramList);
-  auto func = FuncDecl::create(Context, SourceLoc(), StaticSpellingKind::None,
-                               SourceLoc(), Name,
-                               SourceLoc(), SourceLoc(), SourceLoc(),
-                               GenericParams, FnType, paramList,
+  auto func = FuncDecl::create(Context, /*StaticLoc=*/SourceLoc(),
+                               StaticSpellingKind::None,
+                               /*FuncLoc=*/SourceLoc(),
+                               Name, /*NameLoc=*/SourceLoc(),
+                               /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
+                               /*AccessorKeywordLoc=*/SourceLoc(),
+                               GenericParams, paramList, FnType,
                                TypeLoc::withoutLoc(ResBodyType), DC);
     
   func->setInterfaceType(InterfaceType);
@@ -780,6 +787,27 @@ static ValueDecl *getCastFromBridgeObjectOperation(ASTContext &C,
   default:
     llvm_unreachable("not a cast from bridge object op");
   }
+}
+
+static ValueDecl *getUnsafeGuaranteed(ASTContext &C, Identifier Id) {
+  // <T : AnyObject> T -> (T, Int8Ty)
+  //
+  GenericSignatureBuilder builder(C);
+  auto T = makeGenericParam();
+  builder.addParameter(T);
+  Type Int8Ty = BuiltinIntegerType::get(8, C);
+  builder.setResult(makeTuple(T, makeConcrete(Int8Ty)));
+  return builder.build(Id);
+}
+
+static ValueDecl *getUnsafeGuaranteedEnd(ASTContext &C, Identifier Id) {
+  // Int8Ty -> ()
+  Type Int8Ty = BuiltinIntegerType::get(8, C);
+  return getBuiltinFunction(Id, { Int8Ty }, TupleType::getEmpty(C));
+}
+
+static ValueDecl *getOnFastPath(ASTContext &Context, Identifier Id) {
+  return getBuiltinFunction(Id, {}, TupleType::getEmpty(Context));
 }
 
 static ValueDecl *getCastReferenceOperation(ASTContext &ctx,
@@ -1574,10 +1602,20 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
     if (Types.size() != 1) return nullptr;
     return getCheckedConversionOperation(Context, Id, Types[0]);
 
+  case BuiltinValueKind::UnsafeGuaranteed:
+    return getUnsafeGuaranteed(Context, Id);
+
+  case BuiltinValueKind::UnsafeGuaranteedEnd:
+    return getUnsafeGuaranteedEnd(Context, Id);
+
+  case BuiltinValueKind::OnFastPath:
+    return getOnFastPath(Context, Id);
+
   case BuiltinValueKind::IntToFPWithOverflow:
     if (Types.size() != 2) return nullptr;
     return getIntToFPWithOverflowOperation(Context, Id, Types[0], Types[1]);
   }
+
   llvm_unreachable("bad builtin value!");
 }
 

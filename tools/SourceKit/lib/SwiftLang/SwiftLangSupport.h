@@ -20,6 +20,8 @@
 #include "SourceKit/Support/ThreadSafeRefCntPtr.h"
 #include "SourceKit/Support/Tracing.h"
 #include "swift/Basic/ThreadSafeRefCounted.h"
+#include "swift/IDE/Formatting.h"
+#include "swift/Index/IndexSymbol.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Mutex.h"
@@ -57,17 +59,13 @@ namespace SourceKit {
 class SwiftEditorDocument :
     public ThreadSafeRefCountedBase<SwiftEditorDocument> {
 
-
   struct Implementation;
   Implementation &Impl;
 
-  size_t getLineOffset(unsigned LineIndex);
-  size_t getTrimmedLineOffset(unsigned LineIndex);
-
 public:
-  struct CodeFormatOptions;
 
-  SwiftEditorDocument(StringRef FilePath, SwiftLangSupport &LangSupport);
+  SwiftEditorDocument(StringRef FilePath, SwiftLangSupport &LangSupport,
+       swift::ide::CodeFormatOptions Options = swift::ide::CodeFormatOptions());
   ~SwiftEditorDocument();
 
   ImmutableTextSnapshotRef initializeText(llvm::MemoryBuffer *Buf,
@@ -91,10 +89,7 @@ public:
   void formatText(unsigned Line, unsigned Length, EditorConsumer &Consumer);
   void expandPlaceholder(unsigned Offset, unsigned Length,
                          EditorConsumer &Consumer);
-  StringRef getTrimmedTextForLine(unsigned Line);
-  size_t getExpandedIndentForLine(unsigned LineIndex);
-
-  const CodeFormatOptions &getFormatOptions();
+  const swift::ide::CodeFormatOptions &getFormatOptions();
 
   static void reportDocumentStructure(swift::SourceFile &SrcFile,
                                       EditorConsumer &Consumer);
@@ -137,6 +132,7 @@ class SessionCache : public ThreadSafeRefCountedBase<SessionCache> {
   CompletionSink sink;
   std::vector<Completion *> sortedCompletions;
   CompletionKind completionKind;
+  bool completionHasExpectedTypes;
   FilterRules filterRules;
   llvm::sys::Mutex mtx;
 
@@ -144,15 +140,18 @@ public:
   SessionCache(CompletionSink &&sink,
                std::unique_ptr<llvm::MemoryBuffer> &&buffer,
                std::vector<std::string> &&args, CompletionKind completionKind,
-               FilterRules filterRules)
+               bool hasExpectedTypes, FilterRules filterRules)
       : buffer(std::move(buffer)), args(std::move(args)), sink(std::move(sink)),
-        completionKind(completionKind), filterRules(std::move(filterRules)) {}
+        completionKind(completionKind),
+        completionHasExpectedTypes(hasExpectedTypes),
+        filterRules(std::move(filterRules)) {}
   void setSortedCompletions(std::vector<Completion *> &&completions);
   ArrayRef<Completion *> getSortedCompletions();
   llvm::MemoryBuffer *getBuffer();
   ArrayRef<std::string> getCompilerArgs();
   const FilterRules &getFilterRules();
   CompletionKind getCompletionKind();
+  bool getCompletionHasExpectedTypes();
 };
 typedef RefPtr<SessionCache> SessionCacheRef;
 
@@ -233,6 +232,7 @@ public:
 
   static SourceKit::UIdent getUIDForDecl(const swift::Decl *D,
                                          bool IsRef = false);
+  static SourceKit::UIdent getUIDForExtensionOfDecl(const swift::Decl *D);
   static SourceKit::UIdent getUIDForLocalVar(bool IsRef = false);
   static SourceKit::UIdent getUIDForCodeCompletionDeclKind(
       swift::ide::CodeCompletionDeclKind Kind, bool IsRef = false);
@@ -247,6 +247,13 @@ public:
   static SourceKit::UIdent getUIDForSyntaxStructureElementKind(
       swift::ide::SyntaxStructureElementKind Kind);
 
+  static SourceKit::UIdent getUIDForSymbol(swift::index::SymbolKind kind,
+                                           swift::index::SymbolSubKindSet subKinds,
+                                           bool isRef);
+
+  static std::vector<UIdent> UIDsFromDeclAttributes(const swift::DeclAttributes &Attrs);
+
+
   static bool printDisplayName(const swift::ValueDecl *D, llvm::raw_ostream &OS);
 
   /// Generate a USR for a Decl, including the prefix.
@@ -258,6 +265,22 @@ public:
   static bool printAccessorUSR(const swift::AbstractStorageDecl *D,
                                swift::AccessorKind AccKind,
                                llvm::raw_ostream &OS);
+
+  /// Annotates a declaration with XML tags that describe the key substructure
+  /// of the declaration for CursorInfo/DocInfo.
+  ///
+  /// Prints declarations with decl- and type-specific tags derived from the
+  /// UIDs used for decl/refs.
+  ///
+  /// FIXME: This move to libIDE, but currently depends on the UIdentVisitor.
+  static void printFullyAnnotatedDeclaration(const swift::ValueDecl *VD,
+                                             swift::Type BaseTy,
+                                             llvm::raw_ostream &OS);
+
+  static void printFullyAnnotatedSynthesizedDeclaration(
+                                            const swift::ValueDecl *VD,
+                                            swift::NominalTypeDecl *Target,
+                                            llvm::raw_ostream &OS);
 
   /// Tries to resolve the path to the real file-system path. If it fails it
   /// returns the original path;
@@ -302,12 +325,16 @@ public:
   void editorOpenInterface(EditorConsumer &Consumer,
                            StringRef Name,
                            StringRef ModuleName,
-                           ArrayRef<const char *> Args) override;
+                           Optional<StringRef> Group,
+                           ArrayRef<const char *> Args,
+                           bool SynthesizedExtensions,
+                           Optional<StringRef> InterestedUSR) override;
 
   void editorOpenHeaderInterface(EditorConsumer &Consumer,
                                  StringRef Name,
                                  StringRef HeaderName,
-                                 ArrayRef<const char *> Args) override;
+                                 ArrayRef<const char *> Args,
+                                 bool SynthesizedExtensions) override;
 
   void editorOpenSwiftSourceInterface(StringRef Name,
                                       StringRef SourceName,
@@ -336,6 +363,10 @@ public:
                      ArrayRef<const char *> Args,
                      std::function<void(const CursorInfo &)> Receiver) override;
 
+  void getCursorInfoFromUSR(
+      StringRef Filename, StringRef USR, ArrayRef<const char *> Args,
+      std::function<void(const CursorInfo &)> Receiver) override;
+
   void findRelatedIdentifiersInFile(StringRef Filename, unsigned Offset,
                                     ArrayRef<const char *> Args,
               std::function<void(const RelatedIdentsInfo &)> Receiver) override;
@@ -350,6 +381,9 @@ public:
 
   void findInterfaceDocument(StringRef ModuleName, ArrayRef<const char *> Args,
                std::function<void(const InterfaceDocInfo &)> Receiver) override;
+
+  void findModuleGroups(StringRef ModuleName, ArrayRef<const char *> Args,
+               std::function<void(ArrayRef<StringRef>, StringRef Error)> Receiver) override;
 };
 
 namespace trace {

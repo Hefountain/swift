@@ -18,13 +18,13 @@ infix operator ++++ {
   associativity left
 }
 
-infix func fn_binary(lhs: Int, rhs: Int) {}  // expected-error {{'infix' requires a function with an operator identifier}}
+infix func fn_binary(_ lhs: Int, rhs: Int) {}  // expected-error {{'infix' requires a function with an operator identifier}}
 
 
 func ++++(lhs: X, rhs: X) -> X {}
 func ++++(lhs: Y, rhs: Y) -> Y {} // okay
 
-func useInt(x: Int) {}
+func useInt(_ x: Int) {}
 func test() {
   var x : Int  
   let y : Int = 42
@@ -38,11 +38,11 @@ prefix operator ~~ {}
 postfix operator ~~ {}
 infix operator ~~ {}
 
-postfix func foo(x: Int) {} // expected-error {{'postfix' requires a function with an operator identifier}}
+postfix func foo(_ x: Int) {} // expected-error {{'postfix' requires a function with an operator identifier}}
 postfix func ~~(x: Int) -> Float { return Float(x) }
 postfix func ~~(x: Int, y: Int) {} // expected-error {{'postfix' requires a function with one argument}}
 prefix func ~~(x: Float) {}
-func test_postfix(x: Int) {
+func test_postfix(_ x: Int) {
   ~~x~~
 }
 
@@ -87,23 +87,23 @@ infix operator +-+= {}
 infix func +-+ (x: Int, y: Int) -> Int {} // expected-error {{'infix' modifier is not required or allowed on func declarations}} {{1-7=}}
 prefix func +-+ (x: Int) -> Int {}
 
-prefix func -+- (inout y: Int) -> Int {} // expected-note 2{{found this candidate}}
-postfix func -+- (inout x: Int) -> Int {} // expected-note 2{{found this candidate}}
+prefix func -+- (y: inout Int) -> Int {} // expected-note 2{{found this candidate}}
+postfix func -+- (x: inout Int) -> Int {} // expected-note 2{{found this candidate}}
 
-infix func +-+= (inout x: Int, y: Int) -> Int {} // expected-error {{'infix' modifier is not required or allowed on func declarations}} {{1-7=}}
+infix func +-+= (x: inout Int, y: Int) -> Int {} // expected-error {{'infix' modifier is not required or allowed on func declarations}} {{1-7=}}
 
 var n = 0
 
 // Infix by context
-(+-+)(1, 2)
+_ = (+-+)(1, 2)
 // Prefix by context
-(+-+)(1)
+_ = (+-+)(1)
 
 // Ambiguous -- could be prefix or postfix
 (-+-)(&n) // expected-error{{ambiguous use of operator '-+-'}}
 
 // Assignment operator refs become inout functions
-(+-+=)(&n, 12)
+_ = (+-+=)(&n, 12)
 (+-+=)(n, 12)   // expected-error {{passing value of type 'Int' to an inout parameter requires explicit '&'}} {{8-8=&}}
 
 var f1 : (Int, Int) -> Int = (+-+)
@@ -129,8 +129,8 @@ func ☃(x: Int, y: Int) -> Bool { return x == y }
 func ☃⃠(x: Int, y: Int) -> Bool { return x != y }
 
 var x, y : Int
-x☃y
-x☃⃠y
+_ = x☃y
+_ = x☃⃠y
 
 // rdar://14705150 - crash on invalid
 func test_14705150() {
@@ -167,7 +167,7 @@ infix operator ? {}  // expected-error {{expected operator name in operator decl
 
 infix operator ??= {}
 
-func ??= <T>(inout result : T?, rhs : Int) {  // ok
+func ??= <T>(result : inout T?, rhs : Int) {  // ok
 }
 
 

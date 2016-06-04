@@ -53,12 +53,12 @@ ValueDecl *DerivedConformance::getDerivableRequirement(NominalTypeDecl *nominal,
     if (name.isSimpleName(ctx.Id_hashValue))
       return getRequirement(KnownProtocolKind::Hashable);
 
-    // ErrorType._code
+    // ErrorProtocol._code
     if (name.isSimpleName(ctx.Id_code_))
-      return getRequirement(KnownProtocolKind::ErrorType);
+      return getRequirement(KnownProtocolKind::ErrorProtocol);
 
-    // _BridgedNSError._NSErrorDomain
-    if (name.isSimpleName(ctx.Id_NSErrorDomain))
+    // _BridgedNSError._nsErrorDomain
+    if (name.isSimpleName(ctx.Id_nsErrorDomain))
       return getRequirement(KnownProtocolKind::BridgedNSError);
 
     return nullptr;
@@ -129,16 +129,18 @@ FuncDecl *DerivedConformance::declareDerivedPropertyGetter(TypeChecker &tc,
                                                  bool isStatic) {
   auto &C = tc.Context;
   auto parentDC = cast<DeclContext>(parentDecl);
-  auto selfDecl = ParamDecl::createSelf(SourceLoc(), parentDC, isStatic);
+  auto selfDecl = ParamDecl::createUnboundSelf(SourceLoc(), parentDC, isStatic);
   ParameterList *params[] = {
     ParameterList::createWithoutLoc(selfDecl),
     ParameterList::createEmpty(C)
   };
   
   FuncDecl *getterDecl =
-    FuncDecl::create(C, SourceLoc(), StaticSpellingKind::None, SourceLoc(),
-                     DeclName(), SourceLoc(), SourceLoc(), SourceLoc(),
-                     nullptr, Type(), params,
+    FuncDecl::create(C, /*StaticLoc=*/SourceLoc(), StaticSpellingKind::None,
+                     /*FuncLoc=*/SourceLoc(), DeclName(), /*NameLoc=*/SourceLoc(),
+                     /*Throws=*/false, /*ThrowsLoc=*/SourceLoc(),
+                     /*AccessorKeywordLoc=*/SourceLoc(),
+                     nullptr, params, Type(),
                      TypeLoc::withoutLoc(propertyContextType), parentDC);
   getterDecl->setImplicit();
   getterDecl->setStatic(isStatic);
@@ -161,11 +163,12 @@ FuncDecl *DerivedConformance::declareDerivedPropertyGetter(TypeChecker &tc,
   Type interfaceType = FunctionType::get(TupleType::getEmpty(C),
                                          propertyInterfaceType);
   Type selfInterfaceType = getterDecl->computeInterfaceSelfType(false);
-  if (auto sig = parentDC->getGenericSignatureOfContext())
+  if (auto sig = parentDC->getGenericSignatureOfContext()) {
+    getterDecl->setGenericSignature(sig);
     interfaceType = GenericFunctionType::get(sig, selfInterfaceType,
                                              interfaceType,
                                              FunctionType::ExtInfo());
-  else
+  } else
     interfaceType = type;
   getterDecl->setInterfaceType(interfaceType);
   getterDecl->setAccessibility(typeDecl->getFormalAccess());

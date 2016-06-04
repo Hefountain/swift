@@ -225,11 +225,11 @@ bool swift::removeShadowedDecls(SmallVectorImpl<ValueDecl*> &decls,
         // If one declaration is in a protocol or extension thereof and the
         // other is not, prefer the one that is not.
         if ((bool)firstDecl->getDeclContext()
-              ->isProtocolOrProtocolExtensionContext()
+              ->getAsProtocolOrProtocolExtensionContext()
               != (bool)secondDecl->getDeclContext()
-                   ->isProtocolOrProtocolExtensionContext()) {
+                   ->getAsProtocolOrProtocolExtensionContext()) {
           if (firstDecl->getDeclContext()
-                ->isProtocolOrProtocolExtensionContext()) {
+                ->getAsProtocolOrProtocolExtensionContext()) {
             shadowed.insert(firstDecl);
             break;
           } else {
@@ -391,6 +391,8 @@ UnqualifiedLookup::UnqualifiedLookup(DeclName Name, DeclContext *DC,
   if (IsKnownNonCascading)
     isCascadingUse = false;
 
+  SmallVector<UnqualifiedLookupResult, 4> UnavailableInnerResults;
+
   // Never perform local lookup for operators.
   if (Name.isOperator()) {
     if (!isCascadingUse.hasValue()) {
@@ -433,7 +435,7 @@ UnqualifiedLookup::UnqualifiedLookup(DeclName Name, DeclContext *DC,
           isCascadingUse = AFD->isCascadingContextForLookup(false);
 
         if (AFD->getExtensionType()) {
-          if (AFD->getDeclContext()->isProtocolOrProtocolExtensionContext()) {
+          if (AFD->getDeclContext()->getAsProtocolOrProtocolExtensionContext()) {
             ExtendedType = AFD->getDeclContext()->getProtocolSelf()
                              ->getArchetype();
 
@@ -479,13 +481,13 @@ UnqualifiedLookup::UnqualifiedLookup(DeclName Name, DeclContext *DC,
         if (!isCascadingUse.hasValue())
           isCascadingUse = ACE->isCascadingContextForLookup(false);
       } else if (ExtensionDecl *ED = dyn_cast<ExtensionDecl>(DC)) {
-        if (ED->isProtocolOrProtocolExtensionContext()) {
+        if (ED->getAsProtocolOrProtocolExtensionContext()) {
           ExtendedType = ED->getProtocolSelf()->getArchetype();
         } else {
           ExtendedType = ED->getExtendedType();
         }
 
-        BaseDecl = ED->isNominalTypeOrNominalTypeExtensionContext();
+        BaseDecl = ED->getAsNominalTypeOrNominalTypeExtensionContext();
         MetaBaseDecl = BaseDecl;
         if (!isCascadingUse.hasValue())
           isCascadingUse = ED->isCascadingContextForLookup(false);
@@ -520,7 +522,7 @@ UnqualifiedLookup::UnqualifiedLookup(DeclName Name, DeclContext *DC,
         if (TypeResolver)
           TypeResolver->resolveDeclSignature(BaseDecl);
 
-        unsigned options = NL_UnqualifiedDefault;
+        NLOptions options = NL_UnqualifiedDefault;
         if (isCascadingUse.getValue())
           options |= NL_KnownCascadingDependency;
         else
@@ -565,9 +567,25 @@ UnqualifiedLookup::UnqualifiedLookup(DeclName Name, DeclContext *DC,
         }
 
         if (FoundAny) {
-          if (DebugClient)
-            filterForDiscriminator(Results, DebugClient);
-          return;
+          // Predicate that determines whether a lookup result should
+          // be unavailable except as a last-ditch effort.
+          auto unavailableLookupResult =
+            [&](const UnqualifiedLookupResult &result) {
+            return result.getValueDecl()->getAttrs()
+                     .isUnavailableInCurrentSwift();
+          };
+
+          // If all of the results we found are unavailable, keep looking.
+          if (std::all_of(Results.begin(), Results.end(),
+                          unavailableLookupResult)) {
+            UnavailableInnerResults.append(Results.begin(), Results.end());
+            Results.clear();
+            FoundAny = false;
+          } else {
+            if (DebugClient)
+              filterForDiscriminator(Results, DebugClient);
+            return;
+          }
         }
 
         // Check the generic parameters if our context is a generic type or
@@ -640,6 +658,14 @@ UnqualifiedLookup::UnqualifiedLookup(DeclName Name, DeclContext *DC,
   // If we've found something, we're done.
   if (!Results.empty())
     return;
+
+  // If we still haven't found anything, but we do have some
+  // declarations that are "unavailable in the current Swift", drop
+  // those in.
+  if (!UnavailableInnerResults.empty()) {
+    Results = std::move(UnavailableInnerResults);
+    return;
+  }
 
   if (!Name.isSimpleName())
     return;
@@ -843,33 +869,6 @@ void MemberLookupTable::destroy() {
   this->~MemberLookupTable();
 }
 
-void NominalTypeDecl::forceDelayedMemberDecls() {
-  if (!hasDelayedMemberDecls())
-    return;
-
-  // Grab the delayed members and then empty the list so we don't recurse.
-  std::unique_ptr<DelayedDecl> DelayedDeclCreator;
-  DelayedMembers.swap(DelayedDeclCreator);
-
-  SmallVector<Decl *, 4> NewDecls;
-  (*DelayedDeclCreator)(NewDecls);
-  for (auto *D : NewDecls) {
-    addMember(D);
-  }
-}
-
-void NominalTypeDecl::setDelayedMemberDecls(const DelayedDecl &delayedMembers) {
-  // FIXME: This method should only be called once so that we only register one
-  // destructor cleanup, but the assert doesn't catch all cases of that.
-  assert(!hasDelayedMemberDecls());
-
-  // Make sure the std::unique_ptr gets destroyed properly so we don't leak.
-  getASTContext().addDestructorCleanup(DelayedMembers);
-
-  DelayedMembers = llvm::make_unique<DelayedDecl>(delayedMembers);
-  setHasDelayedMembers();
-}
-
 void NominalTypeDecl::addedMember(Decl *member) {
   // If we have a lookup table, add the new member to it.
   if (LookupTable.getPointer()) {
@@ -1051,7 +1050,7 @@ bool AbstractStorageDecl::isSetterAccessibleFrom(const DeclContext *DC) const {
 
 bool DeclContext::lookupQualified(Type type,
                                   DeclName member,
-                                  unsigned options,
+                                  NLOptions options,
                                   LazyResolver *typeResolver,
                                   SmallVectorImpl<ValueDecl *> &decls) const {
   using namespace namelookup;
@@ -1061,7 +1060,7 @@ bool DeclContext::lookupQualified(Type type,
     return false;
 
   auto checkLookupCascading = [this, options]() -> Optional<bool> {
-    switch (options & NL_KnownDependencyMask) {
+    switch (static_cast<unsigned>(options & NL_KnownDependencyMask)) {
     case 0:
       return isCascadingContextForLookup(/*excludeFunctions=*/false);
     case NL_KnownNonCascadingDependency:
@@ -1351,7 +1350,8 @@ bool DeclContext::lookupQualified(Type type,
 
       // If we didn't visit this nominal type above, add this
       // declaration to the list.
-      if (!visited.count(nominal) && knownDecls.insert(decl).second)
+      if (!visited.count(nominal) && knownDecls.insert(decl).second &&
+          isAcceptableDecl(nominal, decl))
         decls.push_back(decl);
     }
   }

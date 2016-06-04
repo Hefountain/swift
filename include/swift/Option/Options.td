@@ -131,7 +131,7 @@ def sdk : Separate<["-"], "sdk">, Flags<[FrontendOption]>,
   HelpText<"Compile against <sdk>">, MetaVarName<"<sdk>">;
 
 def D : JoinedOrSeparate<["-"], "D">, Flags<[FrontendOption]>,
-  HelpText<"Specifies one or more build configuration options">;
+  HelpText<"Marks a conditional compilation flag as true">;
 
 def F : JoinedOrSeparate<["-"], "F">, Flags<[FrontendOption]>,
   HelpText<"Add directory to framework search path">;
@@ -218,6 +218,10 @@ def solver_memory_threshold : Separate<["-"], "solver-memory-threshold">,
   Flags<[FrontendOption, HelpHidden, DoesNotAffectIncrementalBuild]>,
   HelpText<"Set the upper bound for memory consumption, in bytes, by the constraint solver">;   
 
+def disable_swift_bridge_attr : Flag<["-"], "disable-swift-bridge-attr">,
+  Flags<[FrontendOption, HelpHidden]>,
+  HelpText<"Disable using the swift bridge attribute">;
+
 // Diagnostic control options
 def suppress_warnings : Flag<["-"], "suppress-warnings">,
   Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
@@ -253,6 +257,16 @@ def link_objc_runtime : Flag<["-"], "link-objc-runtime">,
 def no_link_objc_runtime : Flag<["-"], "no-link-objc-runtime">,
   Flags<[HelpHidden, DoesNotAffectIncrementalBuild]>,
   HelpText<"Don't link in additions to the Objective-C runtime">;
+
+def static_stdlib: Flag<["-"], "static-stdlib">,
+  HelpText<"Statically link the Swift standard library">;
+def no_static_stdlib: Flag<["-"], "no-static-stdlib">,
+  Flags<[HelpHidden]>,
+  HelpText<"Don't statically link the Swift standard library">;
+
+def use_ld : Joined<["-"], "use-ld=">,
+  Flags<[DoesNotAffectIncrementalBuild]>,
+  HelpText<"Specifies the linker to be used">;
 
 def Xlinker : Separate<["-"], "Xlinker">,
   Flags<[DoesNotAffectIncrementalBuild]>,
@@ -290,7 +304,7 @@ def gline_tables_only : Flag<["-"], "gline-tables-only">,
 def AssertConfig : Separate<["-"], "assert-config">,
   Flags<[FrontendOption]>,
   HelpText<"Specify the assert_configuration replacement. "
-           "Possible values are Debug, Release, Replacement.">;
+           "Possible values are Debug, Release, Unchecked, DisableReplacement.">;
 
 // File types
 
@@ -447,5 +461,15 @@ def embed_bitcode_marker : Flag<["-"], "embed-bitcode-marker">,
 def enable_testing : Flag<["-"], "enable-testing">,
   Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
   HelpText<"Allows this module's internal API to be accessed for testing">;
+
+def sanitize_EQ : CommaJoined<["-"], "sanitize=">,
+  Flags<[FrontendOption, NoInteractiveOption]>, MetaVarName<"<check>">,
+  HelpText<"Turn on runtime checks for erroneous behavior.">;
+
+def sanitize_coverage_EQ : CommaJoined<["-"], "sanitize-coverage=">,
+  Flags<[FrontendOption, NoInteractiveOption]>,
+  MetaVarName<"<type>">,
+  HelpText<"Specify the type of coverage instrumentation for Sanitizers and"
+  " additional options separated by commas">;
 
 include "FrontendOptions.td"

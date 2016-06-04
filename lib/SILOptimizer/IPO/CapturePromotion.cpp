@@ -189,7 +189,8 @@ public:
   friend class SILVisitor<ClosureCloner>;
   friend class SILCloner<ClosureCloner>;
 
-  ClosureCloner(SILFunction *Orig, StringRef ClonedName,
+  ClosureCloner(SILFunction *Orig, IsFragile_t Fragile,
+                StringRef ClonedName,
                 TypeSubstitutionMap &InterfaceSubs,
                 TypeSubstitutionMap &ContextSubs,
                 ArrayRef<Substitution> ApplySubs,
@@ -211,7 +212,8 @@ protected:
   }
 
 private:
-  static SILFunction *initCloned(SILFunction *Orig, StringRef ClonedName,
+  static SILFunction *initCloned(SILFunction *Orig, IsFragile_t Fragile,
+                                 StringRef ClonedName,
                                  TypeSubstitutionMap &InterfaceSubs,
                                  IndicesSet &PromotableIndices);
 
@@ -305,13 +307,14 @@ ReachabilityInfo::isReachable(SILBasicBlock *From, SILBasicBlock *To) {
   return FromSet.test(FI->second);
 }
 
-ClosureCloner::ClosureCloner(SILFunction *Orig, StringRef ClonedName,
+ClosureCloner::ClosureCloner(SILFunction *Orig, IsFragile_t Fragile,
+                             StringRef ClonedName,
                              TypeSubstitutionMap &InterfaceSubs,
                              TypeSubstitutionMap &ContextSubs,
                              ArrayRef<Substitution> ApplySubs,
                              IndicesSet &PromotableIndices)
   : TypeSubstCloner<ClosureCloner>(
-                           *initCloned(Orig, ClonedName, InterfaceSubs,
+                           *initCloned(Orig, Fragile, ClonedName, InterfaceSubs,
                                        PromotableIndices),
                            *Orig, ContextSubs, ApplySubs),
     Orig(Orig), PromotableIndices(PromotableIndices) {
@@ -366,10 +369,11 @@ computeNewArgInterfaceTypes(SILFunction *F,
 }
 
 static std::string getSpecializedName(SILFunction *F,
+                                      IsFragile_t Fragile,
                                       IndicesSet &PromotableIndices) {
   Mangle::Mangler M;
   auto P = SpecializationPass::CapturePromotion;
-  FunctionSignatureSpecializationMangler FSSM(P, M, F);
+  FunctionSignatureSpecializationMangler FSSM(P, M, Fragile, F);
   CanSILFunctionType FTy = F->getLoweredFunctionType();
 
   ArrayRef<SILParameterInfo> Parameters = FTy->getParameters();
@@ -394,7 +398,8 @@ static std::string getSpecializedName(SILFunction *F,
 /// *NOTE* PromotableIndices only contains the container value of the box, not
 /// the address value.
 SILFunction*
-ClosureCloner::initCloned(SILFunction *Orig, StringRef ClonedName,
+ClosureCloner::initCloned(SILFunction *Orig, IsFragile_t Fragile,
+                          StringRef ClonedName,
                           TypeSubstitutionMap &InterfaceSubs,
                           IndicesSet &PromotableIndices) {
   SILModule &M = Orig->getModule();
@@ -412,7 +417,7 @@ ClosureCloner::initCloned(SILFunction *Orig, StringRef ClonedName,
                          OrigFTI->getExtInfo(),
                          OrigFTI->getCalleeConvention(),
                          ClonedInterfaceArgTys,
-                         OrigFTI->getResult(),
+                         OrigFTI->getAllResults(),
                          OrigFTI->getOptionalErrorResult(),
                          M.getASTContext());
 
@@ -425,9 +430,9 @@ ClosureCloner::initCloned(SILFunction *Orig, StringRef ClonedName,
          && "SILFunction missing DebugScope");
   assert(!Orig->isGlobalInit() && "Global initializer cannot be cloned");
 
-  auto *Fn = M.getOrCreateFunction(
+  auto *Fn = M.createFunction(
       Orig->getLinkage(), ClonedName, SubstTy, Orig->getContextGenericParams(),
-      Orig->getLocation(), Orig->isBare(), IsNotTransparent, Orig->isFragile(),
+      Orig->getLocation(), Orig->isBare(), IsNotTransparent, Fragile,
       Orig->isThunk(), Orig->getClassVisibility(), Orig->getInlineStrategy(),
       Orig->getEffectsKind(), Orig, Orig->getDebugScope());
   for (auto &Attr : Orig->getSemanticsAttrs())
@@ -680,8 +685,10 @@ isNonescapingUse(Operand *O, SmallVectorImpl<SILInstruction*> &Mutations) {
   // An apply is ok if the argument is used as an inout parameter or an
   // indirect return, but counts as a possible mutation in both cases.
   if (auto *AI = dyn_cast<ApplyInst>(U)) {
-    if (AI->getSubstCalleeType()
-          ->getParameters()[O->getOperandNumber()-1].isIndirect()) {
+    auto argIndex = O->getOperandNumber()-1;
+    auto convention =
+      AI->getSubstCalleeType()->getSILArgumentConvention(argIndex);
+    if (isIndirectConvention(convention)) {
       Mutations.push_back(AI);
       return true;
     }
@@ -700,10 +707,11 @@ isNonescapingUse(Operand *O, SmallVectorImpl<SILInstruction*> &Mutations) {
 }
 
 static bool signatureHasDependentTypes(SILFunctionType &CalleeTy) {
-  if (CalleeTy.getSemanticResultSILType().hasTypeParameter())
-    return true;
+  for (auto Result : CalleeTy.getAllResults())
+    if (Result.getType()->hasTypeParameter())
+      return true;
 
-  for (auto ParamTy : CalleeTy.getParameterSILTypesWithoutIndirectResult())
+  for (auto ParamTy : CalleeTy.getParameterSILTypes())
     if (ParamTy.hasTypeParameter())
       return true;
 
@@ -744,9 +752,9 @@ examineAllocBoxInst(AllocBoxInst *ABI, ReachabilityInfo &RI,
       // Calculate the index into the closure's argument list of the captured
       // box pointer (the captured address is always the immediately following
       // index so is not stored separately);
-      unsigned Index = OpNo - 1 + closureType->getParameters().size();
+      unsigned Index = OpNo - 1 + closureType->getNumSILArguments();
 
-      auto *Fn = PAI->getCalleeFunction();
+      auto *Fn = PAI->getReferencedFunction();
       if (!Fn || !Fn->isDefinition())
         return false;
 
@@ -844,7 +852,7 @@ constructClonedFunction(PartialApplyInst *PAI, FunctionRefInst *FRI,
   auto genericSig = F->getLoweredFunctionType()->getGenericSignature();
   auto *genericParams = F->getContextGenericParams();
 
-  if (ApplySubs.size()) {
+  if (!ApplySubs.empty()) {
     InterfaceSubs = genericSig->getSubstitutionMap(ApplySubs);
     ContextSubs = genericParams->getSubstitutionMap(ApplySubs);
   } else {
@@ -855,14 +863,21 @@ constructClonedFunction(PartialApplyInst *PAI, FunctionRefInst *FRI,
 
   // Create the Cloned Name for the function.
   SILFunction *Orig = FRI->getReferencedFunction();
-  auto ClonedName = getSpecializedName(Orig, PromotableIndices);
+
+  IsFragile_t Fragile = IsNotFragile;
+  if (F->isFragile() && Orig->isFragile())
+    Fragile = IsFragile;
+
+  auto ClonedName = getSpecializedName(Orig, Fragile, PromotableIndices);
 
   // If we already have such a cloned function in the module then just use it.
-  if (auto *PrevF = F->getModule().lookUpFunction(ClonedName))
+  if (auto *PrevF = F->getModule().lookUpFunction(ClonedName)) {
+    assert(PrevF->isFragile() == Fragile);
     return PrevF;
+  }
 
   // Otherwise, create a new clone.
-  ClosureCloner cloner(Orig, ClonedName, InterfaceSubs,
+  ClosureCloner cloner(Orig, Fragile, ClonedName, InterfaceSubs,
                        ContextSubs, ApplySubs, PromotableIndices);
   cloner.populateCloned();
   return cloner.getCloned();

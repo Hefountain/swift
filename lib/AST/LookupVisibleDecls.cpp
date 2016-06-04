@@ -20,6 +20,7 @@
 #include "swift/AST/AST.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/STLExtras.h"
+#include "swift/Sema/IDETypeChecking.h"
 #include "llvm/ADT/SetVector.h"
 #include <set>
 
@@ -47,9 +48,12 @@ private:
 
   unsigned InheritsSuperclassInitializers : 1;
 
+  /// Should instance members be included even if lookup is performed on a type?
+  unsigned IncludeInstanceMembers : 1;
+
   LookupState()
       : IsQualified(0), IsOnMetatype(0), IsOnSuperclass(0),
-        InheritsSuperclassInitializers(0) {}
+        InheritsSuperclassInitializers(0), IncludeInstanceMembers(0) {}
 
 public:
   LookupState(const LookupState &) = default;
@@ -72,6 +76,7 @@ public:
   bool isInheritsSuperclassInitializers() const {
     return InheritsSuperclassInitializers;
   }
+  bool isIncludingInstanceMembers() const { return IncludeInstanceMembers; }
 
   LookupState withOnMetatype() const {
     auto Result = *this;
@@ -96,6 +101,12 @@ public:
     Result.InheritsSuperclassInitializers = 0;
     return Result;
   }
+
+  LookupState withIncludedInstanceMembers() const {
+    auto Result = *this;
+    Result.IncludeInstanceMembers = 1;
+    return Result;
+  }
 };
 } // unnamed namespace
 
@@ -108,8 +119,10 @@ static bool areTypeDeclsVisibleInLookupMode(LookupState LS) {
 static bool isDeclVisibleInLookupMode(ValueDecl *Member, LookupState LS,
                                       const DeclContext *FromContext,
                                       LazyResolver *TypeResolver) {
-  if (TypeResolver)
+  if (TypeResolver) {
     TypeResolver->resolveDeclSignature(Member);
+    TypeResolver->resolveAccessibility(Member);
+  }
 
   // Check accessibility when relevant.
   if (!Member->getDeclContext()->isLocalContext() &&
@@ -135,7 +148,7 @@ static bool isDeclVisibleInLookupMode(ValueDecl *Member, LookupState LS,
       return false;
 
     // Cannot use instance properties on metatypes.
-    if (LS.isOnMetatype() && !VD->isStatic())
+    if (LS.isOnMetatype() && !VD->isStatic() && !LS.isIncludingInstanceMembers())
       return false;
 
     return true;
@@ -174,8 +187,11 @@ static void doGlobalExtensionLookup(Type BaseType,
 
   // Look in each extension of this type.
   for (auto extension : nominal->getExtensions()) {
+    if (!isExtensionApplied(*const_cast<DeclContext*>(CurrDC), BaseType,
+                            extension))
+      continue;
     bool validatedExtension = false;
-    if (TypeResolver && extension->isProtocolExtensionContext()) {
+    if (TypeResolver && extension->getAsProtocolExtensionContext()) {
       if (!TypeResolver->isProtocolExtensionUsable(
               const_cast<DeclContext *>(CurrDC), BaseType, extension)) {
         continue;
@@ -366,8 +382,7 @@ static void lookupDeclsFromProtocolsBeingConformedTo(
         // Skip type decls if they aren't visible, or any type that has a
         // witness. This cuts down on duplicates.
         if (areTypeDeclsVisibleInLookupMode(LS) &&
-            (!NormalConformance->hasTypeWitness(ATD) ||
-             NormalConformance->usesDefaultDefinition(ATD))) {
+            !NormalConformance->hasTypeWitness(ATD)) {
           Consumer.foundDecl(ATD, ReasonForThisProtocol);
         }
         continue;
@@ -375,11 +390,13 @@ static void lookupDeclsFromProtocolsBeingConformedTo(
       if (auto *VD = dyn_cast<ValueDecl>(Member)) {
         if (TypeResolver)
           TypeResolver->resolveDeclSignature(VD);
+
         // Skip value requirements that have corresponding witnesses. This cuts
         // down on duplicates.
         if (!NormalConformance->hasWitness(VD) ||
-            NormalConformance->usesDefaultDefinition(VD) ||
-            NormalConformance->getWitness(VD, nullptr) == nullptr) {
+            NormalConformance->getWitness(VD, nullptr) == nullptr ||
+            NormalConformance->getWitness(VD, nullptr).getDecl()->getFullName()
+              != VD->getFullName()) {
           Consumer.foundDecl(VD, ReasonForThisProtocol);
         }
       }
@@ -436,13 +453,17 @@ static void lookupVisibleMemberDeclsImpl(
     // declared type to see what we're dealing with.
     Type Ty = MTT->getInstanceType();
 
+    LookupState subLS = LookupState::makeQualified().withOnMetatype();
+    if (LS.isIncludingInstanceMembers()) {
+      subLS = subLS.withIncludedInstanceMembers();
+    }
+
     // Just perform normal dot lookup on the type see if we find extensions or
     // anything else.  For example, type SomeTy.SomeMember can look up static
     // functions, and can even look up non-static functions as well (thus
     // getting the address of the member).
-    lookupVisibleMemberDeclsImpl(Ty, Consumer, CurrDC,
-                                 LookupState::makeQualified().withOnMetatype(),
-                                 Reason, TypeResolver, Visited);
+    lookupVisibleMemberDeclsImpl(Ty, Consumer, CurrDC, subLS, Reason,
+                                 TypeResolver, Visited);
     return;
   }
 
@@ -521,6 +542,7 @@ static void lookupVisibleMemberDeclsImpl(
 }
 
 namespace {
+
 struct FoundDeclTy {
   ValueDecl *D;
   DeclVisibilityKind Reason;
@@ -529,13 +551,39 @@ struct FoundDeclTy {
       : D(D), Reason(Reason) {}
 
   friend bool operator==(const FoundDeclTy &LHS, const FoundDeclTy &RHS) {
+    // If this ever changes - e.g. to include Reason - be sure to also update
+    // DenseMapInfo<FoundDeclTy>::getHashValue().
     return LHS.D == RHS.D;
   }
+};
 
-  friend bool operator<(const FoundDeclTy &LHS, const FoundDeclTy &RHS) {
-    return LHS.D < RHS.D;
+} // end anonymous namespace
+
+namespace llvm {
+
+template <> struct DenseMapInfo<FoundDeclTy> {
+  static inline FoundDeclTy getEmptyKey() {
+    return FoundDeclTy{nullptr, DeclVisibilityKind::LocalVariable};
+  }
+
+  static inline FoundDeclTy getTombstoneKey() {
+    return FoundDeclTy{reinterpret_cast<ValueDecl *>(0x1),
+                       DeclVisibilityKind::LocalVariable};
+  }
+
+  static unsigned getHashValue(const FoundDeclTy &Val) {
+    // Note: FoundDeclTy::operator== only considers D, so don't hash Reason here.
+    return llvm::hash_value(Val.D);
+  }
+
+  static bool isEqual(const FoundDeclTy &LHS, const FoundDeclTy &RHS) {
+    return LHS == RHS;
   }
 };
+
+} // end llvm namespace
+
+namespace {
 
 /// Similar to swift::conflicting, but lenient about protocol extensions which
 /// don't affect code completion's concept of overloading.
@@ -573,15 +621,29 @@ public:
   llvm::SetVector<FoundDeclTy> DeclsToReport;
   Type BaseTy;
   const DeclContext *DC;
+  LazyResolver *TypeResolver;
 
-  OverrideFilteringConsumer(Type BaseTy, const DeclContext *DC)
-      : BaseTy(BaseTy->getRValueType()), DC(DC) {
+  OverrideFilteringConsumer(Type BaseTy, const DeclContext *DC,
+                            LazyResolver *resolver)
+      : BaseTy(BaseTy->getRValueType()), DC(DC), TypeResolver(resolver) {
     assert(DC && BaseTy);
   }
 
   void foundDecl(ValueDecl *VD, DeclVisibilityKind Reason) override {
     if (!AllFoundDecls.insert(VD).second)
       return;
+
+    // If this kind of declaration doesn't participate in overriding, there's
+    // no filtering to do here.
+    if (!isa<AbstractFunctionDecl>(VD) && !isa<AbstractStorageDecl>(VD)) {
+      DeclsToReport.insert(FoundDeclTy(VD, Reason));
+      return;
+    }
+
+    if (TypeResolver) {
+      TypeResolver->resolveDeclSignature(VD);
+      TypeResolver->resolveAccessibility(VD);
+    }
 
     if (VD->isInvalid()) {
       FoundDecls[VD->getName()].insert(VD);
@@ -672,7 +734,7 @@ public:
 static void lookupVisibleMemberDecls(
     Type BaseTy, VisibleDeclConsumer &Consumer, const DeclContext *CurrDC,
     LookupState LS, DeclVisibilityKind Reason, LazyResolver *TypeResolver) {
-  OverrideFilteringConsumer ConsumerWrapper(BaseTy, CurrDC);
+  OverrideFilteringConsumer ConsumerWrapper(BaseTy, CurrDC, TypeResolver);
   VisitedSet Visited;
   lookupVisibleMemberDeclsImpl(BaseTy, ConsumerWrapper, CurrDC, LS, Reason,
                                TypeResolver, Visited);
@@ -727,7 +789,7 @@ void swift::lookupVisibleDecls(VisibleDeclConsumer &Consumer,
         BaseDecl = AFD->getImplicitSelfDecl();
         DC = DC->getParent();
 
-        if (DC->isProtocolExtensionContext())
+        if (DC->getAsProtocolExtensionContext())
           ExtendedType = DC->getProtocolSelf()->getArchetype();
 
         if (auto *FD = dyn_cast<FuncDecl>(AFD))
@@ -806,10 +868,15 @@ void swift::lookupVisibleDecls(VisibleDeclConsumer &Consumer,
 
 void swift::lookupVisibleMemberDecls(VisibleDeclConsumer &Consumer, Type BaseTy,
                                      const DeclContext *CurrDC,
-                                     LazyResolver *TypeResolver) {
+                                     LazyResolver *TypeResolver,
+                                     bool includeInstanceMembers) {
   assert(CurrDC);
-  ::lookupVisibleMemberDecls(BaseTy, Consumer, CurrDC,
-                             LookupState::makeQualified(),
+  LookupState ls = LookupState::makeQualified();
+  if (includeInstanceMembers) {
+    ls = ls.withIncludedInstanceMembers();
+  }
+
+  ::lookupVisibleMemberDecls(BaseTy, Consumer, CurrDC, ls,
                              DeclVisibilityKind::MemberOfCurrentNominal,
                              TypeResolver);
 }

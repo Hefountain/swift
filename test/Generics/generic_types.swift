@@ -4,7 +4,7 @@ protocol MyFormattedPrintable {
   func myFormat() -> String
 }
 
-func myPrintf(format: String, _ args: MyFormattedPrintable...) {}
+func myPrintf(_ format: String, _ args: MyFormattedPrintable...) {}
 
 extension Int : MyFormattedPrintable {
   func myFormat() -> String { return "" }
@@ -12,10 +12,10 @@ extension Int : MyFormattedPrintable {
 
 struct S<T : MyFormattedPrintable> {
   var c : T
-  static func f(a: T) -> T {
+  static func f(_ a: T) -> T {
     return a
   }
-  func f(a: T, b: Int) {
+  func f(_ a: T, b: Int) {
     return myPrintf("%v %v %v", a, b, c)
   }
 }
@@ -28,6 +28,7 @@ a.f(1,b: 2)
 var b : Int = SInt.f(1)
 
 struct S2<T> {
+  @discardableResult
   static func f() -> T {
     S2.f()
   }
@@ -38,41 +39,41 @@ struct X { }
 var d : S<X> // expected-error{{type 'X' does not conform to protocol 'MyFormattedPrintable'}}
 
 enum Optional<T> {
-  case Element(T)
-  case None
+  case element(T)
+  case none
 
-  init() { self = .None }
-  init(_ t: T) { self = .Element(t) }
+  init() { self = .none }
+  init(_ t: T) { self = .element(t) }
 }
 typealias OptionalInt = Optional<Int>
-var uniontest1 : (Int) -> Optional<Int> = OptionalInt.Element
-var uniontest2 : Optional<Int> = OptionalInt.None
+var uniontest1 : (Int) -> Optional<Int> = OptionalInt.element
+var uniontest2 : Optional<Int> = OptionalInt.none
 var uniontest3 = OptionalInt(1)
 
 // FIXME: Stuff that should work, but doesn't yet.
-// var uniontest4 : OptInt = .None
+// var uniontest4 : OptInt = .none
 // var uniontest5 : OptInt = .Some(1)
 
-func formattedTest<T : MyFormattedPrintable>(a: T) {
+func formattedTest<T : MyFormattedPrintable>(_ a: T) {
   myPrintf("%v", a)
 }
 struct formattedTestS<T : MyFormattedPrintable> {
-  func f(a: T) {
+  func f(_ a: T) {
     formattedTest(a)
   }
 }
 
-struct GenericReq<
-  T : GeneratorType, U : GeneratorType where T.Element == U.Element
-> {}
+struct GenericReq<T : IteratorProtocol, U : IteratorProtocol>
+  where T.Element == U.Element {
+}
 
-func getFirst<R : GeneratorType>(r: R) -> R.Element {
+func getFirst<R : IteratorProtocol>(_ r: R) -> R.Element {
   var r = r
   return r.next()!
 }
 
-func testGetFirst(ir: Range<Int>) {
-  _ = getFirst(ir.generate()) as Int
+func testGetFirst(ir: CountableRange<Int>) {
+  _ = getFirst(ir.makeIterator()) as Int
 }
 
 struct XT<T> {
@@ -137,8 +138,8 @@ var d2 : Dictionary<String, Int>
 d1["hello"] = d2["world"]
 i = d2["blarg"]
 
-struct RangeOfPrintables<R : SequenceType
-         where R.Generator.Element : MyFormattedPrintable> {
+struct RangeOfPrintables<R : Sequence>
+  where R.Iterator.Element : MyFormattedPrintable {
   var r : R
 
   func format() -> String {
@@ -151,35 +152,35 @@ struct RangeOfPrintables<R : SequenceType
 }
 
 struct Y {}
-struct SequenceY : SequenceType, GeneratorType {
-  typealias Generator = SequenceY
+struct SequenceY : Sequence, IteratorProtocol {
+  typealias Iterator = SequenceY
   typealias Element = Y
 
   func next() -> Element? { return Y() }
-  func generate() -> Generator { return self }
+  func makeIterator() -> Iterator { return self }
 }
 
-func useRangeOfPrintables(roi : RangeOfPrintables<[Int]>) {
-  var rop : RangeOfPrintables<X> // expected-error{{type 'X' does not conform to protocol 'SequenceType'}}
+func useRangeOfPrintables(_ roi : RangeOfPrintables<[Int]>) {
+  var rop : RangeOfPrintables<X> // expected-error{{type 'X' does not conform to protocol 'Sequence'}}
   var rox : RangeOfPrintables<SequenceY> // expected-error{{type 'Element' (aka 'Y') does not conform to protocol 'MyFormattedPrintable'}}
 }
 
 struct HasNested<T> {
   init<U>(_ t: T, _ u: U) {}
-  func f<U>(t: T, u: U) -> (T, U) {}
+  func f<U>(_ t: T, u: U) -> (T, U) {}
 
   struct InnerGeneric<U> { // expected-error{{generic type 'InnerGeneric' nested}}
     init() {}
-    func g<V>(t: T, u: U, v: V) -> (T, U, V) {}
+    func g<V>(_ t: T, u: U, v: V) -> (T, U, V) {}
   }
 
   struct Inner { // expected-error{{nested in generic type}}
     init (_ x: T) {}
-    func identity(x: T) -> T { return x }
+    func identity(_ x: T) -> T { return x }
   }
 }
 
-func useNested(ii: Int, hni: HasNested<Int>,
+func useNested(_ ii: Int, hni: HasNested<Int>,
                xisi : HasNested<Int>.InnerGeneric<String>,
                xfs: HasNested<Float>.InnerGeneric<String>) {
   var i = ii, xis = xisi
@@ -188,7 +189,7 @@ func useNested(ii: Int, hni: HasNested<Int>,
   typealias InnerF = HasNested<Float>.Inner
   var innerF : InnerF = innerI // expected-error{{cannot convert value of type 'InnerI' (aka 'HasNested<Int>.Inner') to specified type 'InnerF' (aka 'HasNested<Float>.Inner')}}
 
-  innerI.identity(i)
+  _ = innerI.identity(i)
   i = innerI.identity(i)
 
   // Generic function in a generic class
@@ -200,8 +201,7 @@ func useNested(ii: Int, hni: HasNested<Int>,
 
   // Generic constructor of a generic struct
   HNI(1, 2.71828) // expected-warning{{unused}}
-  // FIXME: Should report this error: {{cannot convert the expression's type 'HNI' to type 'Int'}}
-  HNI(1.5, 2.71828) // expected-error{{cannot invoke initializer for type 'HNI' with an argument list of type '(Double, Double)'}} expected-note{{expected an argument list of type '(T, U)'}}
+  HNI(1.5, 2.71828) // expected-error{{'Double' is not convertible to 'Int'}}
 
   // Generic function in a nested generic struct
   var ids = xis.g(1, u: "Hello", v: 3.14159)
@@ -219,18 +219,18 @@ class Foo<T> {
 }
 
 class Bar : Foo<Int> {
-  func f(x: Int) -> Nested {
+  func f(_ x: Int) -> Nested {
     return x
   }
 
   struct Inner {
-    func g(x: Int) -> Nested {
+    func g(_ x: Int) -> Nested {
       return x
     }
 
     func withLocal() {
       struct Local {
-        func h(x: Int) -> Nested {
+        func h(_ x: Int) -> Nested {
           return x
         }
       }
@@ -239,13 +239,13 @@ class Bar : Foo<Int> {
 }
 
 extension Bar {
-  func g(x: Int) -> Nested {
+  func g(_ x: Int) -> Nested {
     return x
   }
 
   /* This crashes for unrelated reasons: <rdar://problem/14376418>
   struct Inner2 {
-    func f(x: Int) -> Nested {
+    func f(_ x: Int) -> Nested {
       return x
     }
   }
@@ -273,11 +273,11 @@ var xarray : XArray = [1, 2, 3]
 
 // Type parameters can be referenced only via unqualified name lookup
 struct XParam<T> {
-  func foo(x: T) {
+  func foo(_ x: T) {
     _ = x as T
   }
 
-  static func bar(x: T) {
+  static func bar(_ x: T) {
     _ = x as T
   }
 }
@@ -304,15 +304,13 @@ struct X4 : P, Q {
   typealias AssocQ = String
 }
 
-struct X5<T, U where T: P, T: Q, T.AssocP == T.AssocQ> { } // expected-note{{requirement specified as 'T.AssocP' == 'T.AssocQ' [with T = X4]}}
+struct X5<T, U> where T: P, T: Q, T.AssocP == T.AssocQ { } // expected-note{{requirement specified as 'T.AssocP' == 'T.AssocQ' [with T = X4]}}
 
 var y: X5<X4, Int> // expected-error{{'X5' requires the types 'AssocP' (aka 'Int') and 'AssocQ' (aka 'String') be equivalent}}
 
 // Recursive generic signature validation.
 class Top {}
-class Bottom<T : Bottom<Top>> {} // expected-error 2{{type may not reference itself as a requirement}}
-// expected-error@-1{{Bottom' requires that 'Top' inherit from 'Bottom<Top>'}}
-// expected-note@-2{{requirement specified as 'T' : 'Bottom<Top>' [with T = Top]}}
+class Bottom<T : Bottom<Top>> {} // expected-error {{type may not reference itself as a requirement}}
 
 class X6<T> {
   let d: D<T>
@@ -332,3 +330,5 @@ struct UnsolvableInheritance1<T : T.A> {}
 struct UnsolvableInheritance2<T : U.A, U : T.A> {}
 // expected-error@-1 {{inheritance from non-protocol, non-class type 'U.A'}}
 // expected-error@-2 {{inheritance from non-protocol, non-class type 'T.A'}}
+
+enum X7<T> where X7.X : G { case X } // expected-error{{'X' is not a member type of 'X7<T>'}}

@@ -20,53 +20,57 @@ set(SWIFTLIB_ESSENTIAL
   Algorithm.swift
   ArrayBody.swift
   ArrayBuffer.swift
-  ArrayBufferType.swift
+  ArrayBufferProtocol.swift
   ArrayCast.swift
-  ArrayType.swift
   Arrays.swift.gyb
+  ArrayType.swift
   Assert.swift
   AssertCommon.swift
+  BidirectionalCollection.swift
   Bool.swift
-  BooleanType.swift
+  Boolean.swift
   BridgeObjectiveC.swift
   BridgeStorage.swift
   Builtin.swift
   BuiltinMath.swift.gyb
-  CString.swift
-  CTypes.swift
   Character.swift
   CocoaArray.swift
   Collection.swift
   CollectionAlgorithms.swift.gyb
   CompilerProtocols.swift
+  ClosedRange.swift
   ContiguousArrayBuffer.swift
+  CString.swift
+  CTypes.swift
   EmptyCollection.swift
   ErrorType.swift
   Existential.swift
-  Filter.swift
+  Filter.swift.gyb
   FixedPoint.swift.gyb
-  Flatten.swift.gyb
   FlatMap.swift
+  Flatten.swift.gyb
   FloatingPoint.swift.gyb
-  FloatingPointOperations.swift.gyb
   FloatingPointParsing.swift.gyb
+  FloatingPointTypes.swift.gyb
   HashedCollections.swift.gyb
   Hashing.swift
   HeapBuffer.swift
   ImplicitlyUnwrappedOptional.swift
   Index.swift
+  Indices.swift.gyb
   InputStream.swift
   IntegerArithmetic.swift.gyb
   IntegerParsing.swift.gyb
-  Interval.swift.gyb
   Join.swift
-  LazyCollection.swift
+  LazyCollection.swift.gyb
   LazySequence.swift
   LifetimeManager.swift
   ManagedBuffer.swift
-  Map.swift
+  Map.swift.gyb
   Mirrors.swift.gyb
   Misc.swift
+  MutableCollection.swift
+  NewtypeWrapper.swift.gyb
   ObjCMirrors.swift
   Optional.swift
   OptionSet.swift
@@ -74,23 +78,24 @@ set(SWIFTLIB_ESSENTIAL
   Pointer.swift
   Policy.swift
   Print.swift
-  REPL.swift
-  Range.swift
-  RangeReplaceableCollectionType.swift
+  RandomAccessCollection.swift
+  Range.swift.gyb
+  RangeReplaceableCollection.swift.gyb
   Reflection.swift
   Repeat.swift
+  REPL.swift
   Reverse.swift
   Runtime.swift.gyb
   Sequence.swift
-  SequenceWrapper.swift
   SequenceAlgorithms.swift.gyb
+  SequenceWrapper.swift
   SetAlgebra.swift
   ShadowProtocols.swift
   Shims.swift
   Slice.swift.gyb
   Sort.swift.gyb
   StaticString.swift
-  Stride.swift
+  Stride.swift.gyb
   StringCharacterView.swift # ORDER DEPENDENCY: Must precede String.swift
   String.swift
   StringBridge.swift
@@ -98,17 +103,21 @@ set(SWIFTLIB_ESSENTIAL
   StringCore.swift
   StringInterpolation.swift.gyb
   StringLegacy.swift
+  StringRangeReplaceableCollection.swift.gyb
+  StringIndexConversions.swift
   StringUnicodeScalarView.swift
   StringUTF16.swift
   StringUTF8.swift
   SwiftNativeNSArray.swift
+  UnavailableStringAPIs.swift.gyb
   Unicode.swift
   UnicodeScalar.swift
   UnicodeTrie.swift.gyb
-  UnavailableStringAPIs.swift.gyb
   Unmanaged.swift
+  UnsafeBitMap.swift
   UnsafeBufferPointer.swift.gyb
   UnsafePointer.swift.gyb
+  WriteBackMutableSlice.swift
   )
 
 # The complete list of sources in the core standard library.  Includes
@@ -117,24 +126,23 @@ set(SWIFTLIB_SOURCES
   ${SWIFTLIB_ESSENTIAL}
   ### PLEASE KEEP THIS LIST IN ALPHABETICAL ORDER ###
   Availability.swift
-  Bit.swift
   CollectionOfOne.swift
   ExistentialCollection.swift.gyb
   Mirror.swift
   Process.swift
   SliceBuffer.swift
   Tuple.swift.gyb
+  UnfoldSequence.swift
   VarArgs.swift
   Zip.swift
-  Prespecialized.swift
   )
-
+set(GROUP_INFO_JSON_FILE ${CMAKE_CURRENT_SOURCE_DIR}/GroupInfo.json)
 set(swift_core_link_flags)
 set(swift_core_framework_depends)
 set(swift_core_private_link_libraries)
+set(swift_stdlib_compile_flags)
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   list(APPEND swift_core_link_flags "-all_load")
-  list(APPEND swift_core_private_link_libraries swiftRuntime swiftStdlibStubs)
   list(APPEND swift_core_framework_depends Foundation)
   list(APPEND swift_core_framework_depends CoreFoundation)
 else()
@@ -149,21 +157,33 @@ else()
   # effort has been completed.
   #set(LINK_FLAGS
   #  -Wl,--whole-archive swiftRuntime -Wl,--no-whole-archive)
-  list(APPEND swift_core_private_link_libraries swiftRuntime swiftStdlibStubs)
   find_package(ICU REQUIRED COMPONENTS uc i18n)
   list(APPEND swift_core_private_link_libraries
       ${ICU_UC_LIBRARY} ${ICU_I18N_LIBRARY})
+  include_directories(
+      ${ICU_UC_INCLUDE_DIR} ${ICU_I18N_INCLUDE_DIR})
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  find_package(BSD REQUIRED)
+if(CMAKE_SYSTEM_NAME STREQUAL "CYGWIN")
+  execute_process(COMMAND "cygpath" "-u" "$ENV{SYSTEMROOT}"
+      OUTPUT_VARIABLE ENV_SYSTEMROOT)
+
+  list(APPEND swift_core_link_flags "${ENV_SYSTEMROOT}/system32/psapi.dll")
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+  find_library(EXECINFO_LIBRARY execinfo)
   list(APPEND swift_core_private_link_libraries
-      ${BSD_LIBRARIES})
+      ${EXECINFO_LIBRARY})
 endif()
 
 option(SWIFT_CHECK_ESSENTIAL_STDLIB
     "Check core standard library layering by linking its essential subset"
     FALSE)
+
+if(SWIFT_STDLIB_SIL_DEBUGGING)
+  list(APPEND swift_stdlib_compile_flags "-Xfrontend" "-gsil")
+endif()
 
 if(SWIFT_CHECK_ESSENTIAL_STDLIB)
   add_swift_library(swift_stdlib_essential SHARED IS_STDLIB IS_STDLIB_CORE
@@ -180,8 +200,11 @@ add_swift_library(swiftCore SHARED IS_STDLIB IS_STDLIB_CORE
   # and the generated directory as dependencies.
   FILE_DEPENDS
     copy_shim_headers "${SWIFTLIB_DIR}/shims"
+    section_magic
+    ${GROUP_INFO_JSON_FILE}
+  SWIFT_COMPILE_FLAGS ${swift_stdlib_compile_flags}
   LINK_FLAGS ${swift_core_link_flags}
   PRIVATE_LINK_LIBRARIES ${swift_core_private_link_libraries}
+  INCORPORATE_OBJECT_LIBRARIES swiftRuntime swiftStdlibStubs
   FRAMEWORK_DEPENDS ${swift_core_framework_depends}
   INSTALL_IN_COMPONENT stdlib)
-

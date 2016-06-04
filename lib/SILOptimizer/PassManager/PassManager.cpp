@@ -48,6 +48,19 @@ llvm::cl::opt<unsigned> SILNumOptPassesToRun(
     "sil-opt-pass-count", llvm::cl::init(UINT_MAX),
     llvm::cl::desc("Stop optimizing after <N> optimization passes"));
 
+llvm::cl::opt<unsigned> SILFunctionPassPipelineLimit("sil-pipeline-limit",
+                                                     llvm::cl::init(10),
+                                                     llvm::cl::desc(""));
+
+llvm::cl::opt<std::string> SILBreakOnFun(
+    "sil-break-on-function", llvm::cl::init(""),
+    llvm::cl::desc(
+        "Break before running each function pass on a particular function"));
+
+llvm::cl::opt<std::string> SILBreakOnPass(
+    "sil-break-on-pass", llvm::cl::init(""),
+    llvm::cl::desc("Break before running a particular function pass"));
+
 llvm::cl::opt<std::string>
     SILPrintOnlyFun("sil-print-only-function", llvm::cl::init(""),
                     llvm::cl::desc("Only print out the sil for this function"));
@@ -168,12 +181,39 @@ bool SILPassManager::continueTransforming() {
          NumPassesRun < SILNumOptPassesToRun;
 }
 
+bool SILPassManager::analysesUnlocked() {
+  for (auto A : Analysis)
+    if (A->isLocked())
+      return false;
+
+  return true;
+}
+
+// Test the function and pass names we're given against the debug
+// options that force us to break prior to a given pass and/or on a
+// given function.
+static bool breakBeforeRunning(StringRef fnName, StringRef passName) {
+  if (SILBreakOnFun.empty() && SILBreakOnPass.empty())
+    return false;
+
+  if (SILBreakOnFun.empty() && passName == SILBreakOnPass)
+    return true;
+
+  if (SILBreakOnPass.empty() && fnName == SILBreakOnFun)
+    return true;
+
+  return fnName == SILBreakOnFun && passName == SILBreakOnPass;
+}
+
 void SILPassManager::runPassesOnFunction(PassList FuncTransforms,
-                                         SILFunction *F) {
+                                         SILFunction *F,
+                                         bool runToCompletion) {
 
   const SILOptions &Options = getOptions();
 
   CompletedPasses &completedPasses = CompletedPassesMap[F];
+
+  assert(analysesUnlocked() && "Expected all analyses to be unlocked!");
 
   for (auto SFT : FuncTransforms) {
     PrettyStackTraceSILFunctionTransform X(SFT);
@@ -182,11 +222,21 @@ void SILPassManager::runPassesOnFunction(PassList FuncTransforms,
 
     // If nothing changed since the last run of this pass, we can skip this
     // pass.
-    if (completedPasses.test((size_t)SFT->getPassKind()))
+    if (completedPasses.test((size_t)SFT->getPassKind())) {
+      if (SILPrintPassName)
+        llvm::dbgs() << "(Skip) Stage: " << StageName
+                     << " Pass: " << SFT->getName()
+                     << ", Function: " << F->getName() << "\n";
       continue;
+    }
 
-    if (isDisabled(SFT))
+    if (isDisabled(SFT)) {
+      if (SILPrintPassName)
+        llvm::dbgs() << "(Disabled) Stage: " << StageName
+                     << " Pass: " << SFT->getName()
+                     << ", Function: " << F->getName() << "\n";
       continue;
+    }
 
     CurrentPassHasInvalidated = false;
 
@@ -204,7 +254,10 @@ void SILPassManager::runPassesOnFunction(PassList FuncTransforms,
 
     llvm::sys::TimeValue StartTime = llvm::sys::TimeValue::now();
     Mod->registerDeleteNotificationHandler(SFT);
+    if (breakBeforeRunning(F->getName(), SFT->getName()))
+      LLVM_BUILTIN_DEBUGTRAP;
     SFT->run();
+    assert(analysesUnlocked() && "Expected all analyses to be unlocked!");
     Mod->removeDeleteNotificationHandler(SFT);
 
     // Did running the transform result in new functions being added
@@ -238,10 +291,16 @@ void SILPassManager::runPassesOnFunction(PassList FuncTransforms,
 
     ++NumPassesRun;
 
+    if (!continueTransforming())
+      return;
+
+    if (runToCompletion)
+      continue;
+
     // If running the transform resulted in new functions on the top
     // of the worklist, we'll return so that we can begin processing
     // those new functions.
-    if (newFunctionsAdded || !continueTransforming())
+    if (shouldRestartPipeline() || newFunctionsAdded)
       return;
   }
 }
@@ -267,24 +326,80 @@ void SILPassManager::runFunctionPasses(PassList FuncTransforms) {
   // Used to track how many times a given function has been
   // (partially) optimized by the function pass pipeline in this
   // invocation.
-  llvm::DenseMap<SILFunction *, unsigned int> CountOptimized;
+  llvm::DenseMap<SILFunction *, unsigned> CountOptimized;
+
+  // Count of how many iterations we've had since any function was
+  // popped off the function worklist. This is used to ensure progress
+  // and eliminate the chance of going into an infinite loop in cases
+  // where (for example) we have recursive type-based specialization
+  // happening.
+  unsigned IterationsWithoutProgress = 0;
+
+  // The maximum number of functions we'll optimize without popping
+  // any off the worklist. This is expected to non-zero.
+  const unsigned MaxIterationsWithoutProgress = 20;
 
   // Pop functions off the worklist, and run all function transforms
   // on each of them.
   while (!FunctionWorklist.empty() && continueTransforming()) {
     auto *F = FunctionWorklist.back();
 
-    runPassesOnFunction(FuncTransforms, F);
+    // If we've done many iterations without progress, pop the current
+    // function and any other function we've run any optimizations on
+    // on from the stack and then continue.
+    if (IterationsWithoutProgress == (MaxIterationsWithoutProgress - 1)) {
+      // Pop the current (potentially not-yet-optimized) function off.
+      FunctionWorklist.pop_back();
+      IterationsWithoutProgress = 0;
 
+      // Pop any remaining functions that have been optimized (at
+      // least through some portion of the pipeline).
+      while (!FunctionWorklist.empty() &&
+             CountOptimized[FunctionWorklist.back()] > 0)
+        FunctionWorklist.pop_back();
+
+      continue;
+    }
+
+    if (CountOptimized[F] > SILFunctionPassPipelineLimit) {
+      DEBUG(llvm::dbgs() << "*** Hit limit optimizing: " << F->getName()
+                         << '\n');
+      FunctionWorklist.pop_back();
+      IterationsWithoutProgress = 0;
+      continue;
+    }
+
+    assert(
+        !shouldRestartPipeline() &&
+        "Did not expect function pipeline set up to restart from beginning!");
+
+    assert(CountOptimized[F] <= SILFunctionPassPipelineLimit &&
+           "Function optimization count exceeds limit!");
+    auto runToCompletion = CountOptimized[F] == SILFunctionPassPipelineLimit;
+
+    runPassesOnFunction(FuncTransforms, F, runToCompletion);
     ++CountOptimized[F];
+    ++IterationsWithoutProgress;
+
+    if (runToCompletion) {
+      FunctionWorklist.pop_back();
+      IterationsWithoutProgress = 0;
+      clearRestartPipeline();
+      continue;
+    }
+
 
     // If running the function transforms did not result in new
     // functions being added to the top of the worklist, then we're
     // done with this function and can pop it off and continue.
     // Otherwise, we'll return to this function and reoptimize after
     // processing the new functions that were added.
-    if (F == FunctionWorklist.back())
+    if (F == FunctionWorklist.back() && !shouldRestartPipeline()) {
       FunctionWorklist.pop_back();
+      IterationsWithoutProgress = 0;
+    }
+
+    clearRestartPipeline();
   }
 }
 
@@ -313,9 +428,11 @@ void SILPassManager::runModulePass(SILModuleTransform *SMT) {
   }
 
   llvm::sys::TimeValue StartTime = llvm::sys::TimeValue::now();
+  assert(analysesUnlocked() && "Expected all analyses to be unlocked!");
   Mod->registerDeleteNotificationHandler(SMT);
   SMT->run();
   Mod->removeDeleteNotificationHandler(SMT);
+  assert(analysesUnlocked() && "Expected all analyses to be unlocked!");
 
   if (SILPrintPassTime) {
     auto Delta = llvm::sys::TimeValue::now().nanoseconds() -
@@ -340,13 +457,6 @@ void SILPassManager::runModulePass(SILModuleTransform *SMT) {
 }
 
 void SILPassManager::runOneIteration() {
-  // Verify that all analysis were properly unlocked.
-  for (auto A : Analysis) {
-    assert(!A->isLocked() &&
-           "Deleting a locked analysis. Did we forget to unlock ?");
-    (void)A;
-  }
-
   const SILOptions &Options = getOptions();
 
   DEBUG(llvm::dbgs() << "*** Optimizing the module (" << StageName
@@ -430,6 +540,12 @@ SILPassManager::~SILPassManager() {
            "Deleting a locked analysis. Did we forget to unlock ?");
     delete A;
   }
+}
+
+void SILPassManager::restartWithCurrentFunction(SILTransform *T) {
+  assert(isa<SILFunctionTransform>(T) &&
+         "Can only restart the pipeline from function passes");
+  RestartPipeline = true;
 }
 
 /// \brief Reset the state of the pass manager and remove all transformation

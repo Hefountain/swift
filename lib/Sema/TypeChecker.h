@@ -30,6 +30,7 @@
 #include "swift/Basic/OptionSet.h"
 #include "swift/Config.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/TinyPtrVector.h"
 #include <functional>
 
 namespace swift {
@@ -37,6 +38,7 @@ namespace swift {
 class ArchetypeBuilder;
 class GenericTypeResolver;
 class NominalTypeDecl;
+class NormalProtocolConformance;
 class TopLevelContext;
 class TypeChecker;
 
@@ -198,6 +200,10 @@ enum class TypeCheckExprFlags {
   /// If set, this expression is being re-type checked as part of diagnostics,
   /// and so we should not visit bodies of non-single expression closures.
   SkipMultiStmtClosures = 0x40,
+
+  /// Set if the client prefers fixits to be in the form of force unwrapping
+  /// or optional chaining to return an optional.
+  PreferForceUnwrapToOptional = 0x80,
 };
 
 typedef OptionSet<TypeCheckExprFlags> TypeCheckExprOptions;
@@ -394,13 +400,16 @@ withoutContext(TypeResolutionOptions options) {
 /// the OBJC_ATTR_SELECT macro in DiagnosticsSema.def.
 enum class ObjCReason {
   DoNotDiagnose,
+  ExplicitlyCDecl,
   ExplicitlyDynamic,
   ExplicitlyObjC,
   ExplicitlyIBOutlet,
+  ExplicitlyIBAction,
   ExplicitlyNSManaged,
   MemberOfObjCProtocol,
   ImplicitlyObjC,
-  OverridesObjC
+  OverridesObjC,
+  WitnessToObjC,
 };
 
 /// Return the %select discriminator for the OBJC_ATTR_SELECT macro used to
@@ -417,7 +426,12 @@ enum class ConformanceCheckFlags {
   /// Whether we will be using the conformance in the AST.
   ///
   /// This implies that the conformance will have to be complete.
-  Used = 0x02
+  Used = 0x02,
+  /// Whether to suppress dependency tracking entirely.
+  ///
+  /// FIXME: This deals with some oddities with the
+  /// _ObjectiveCBridgeable conformances.
+  SuppressDependencyTracking = 0x04,
 };
 
 /// Options that control protocol conformance checking.
@@ -499,6 +513,59 @@ public:
   llvm::DenseMap<AnyFunctionRef, std::vector<Expr*>> LocalCFunctionPointers;
 
 private:
+  /// Return statements with functions as return values.
+  llvm::DenseMap<AbstractFunctionDecl *, llvm::DenseSet<ReturnStmt *>>
+    FunctionAsReturnValue;
+
+  /// Function apply expressions with a certain function as an arugment.
+  llvm::DenseMap<AbstractFunctionDecl *, llvm::DenseSet<ApplyExpr *>>
+    FunctionAsEscapingArg;
+
+public:
+  /// Record an occurence of a function that captures inout values as an
+  /// argument.
+  ///
+  /// \param decl the function that occurs as an arugment.
+  ///
+  /// \param apply the expression in which the function appears.
+  void addEscapingFunctionAsArgument(AbstractFunctionDecl *decl,
+                                     ApplyExpr *apply) {
+    FunctionAsEscapingArg[decl].insert(apply);
+  }
+
+  /// Find occurences of a function that captures inout values as arguments.
+  ///
+  /// \param decl the function that occurs as an arugment.
+  ///
+  /// \returns Expressions in which the function appears as arguments.
+  llvm::DenseSet<ApplyExpr *> &
+  getEscapingFunctionAsArgument(AbstractFunctionDecl *decl) {
+    return FunctionAsEscapingArg[decl];
+  }
+
+  /// Record an occurence of  a function that captures inout values as a return
+  /// value
+  ///
+  /// \param decl the function that occurs as a return value.
+  ///
+  /// \param stmt the expression in which the function appears.
+  void addEscapingFunctionAsReturnValue(AbstractFunctionDecl *decl,
+                                        ReturnStmt *stmt) {
+    FunctionAsReturnValue[decl].insert(stmt);
+  }
+
+  /// Find occurences of a function that captures inout values as return
+  /// values.
+  ///
+  /// \param decl the function that occurs as a return value.
+  ///
+  /// \returns Expressions in which the function appears as arguments.
+  llvm::DenseSet<ReturnStmt *> &
+  getEscapingFunctionAsReturnValue(AbstractFunctionDecl *decl) {
+    return FunctionAsReturnValue[decl];
+  }
+
+private:
   Type IntLiteralType;
   Type FloatLiteralType;
   Type BooleanLiteralType;
@@ -521,26 +588,22 @@ private:
   /// The \c Swift.UnsafeMutablePointer<T> declaration.
   Optional<NominalTypeDecl *> ArrayDecl;
 
-  /// A set of types that can be trivially mapped to Objective-C types.
-  llvm::DenseSet<CanType> ObjCMappedTypes;
-
   /// A set of types that can be mapped to C integer types.
   llvm::DenseSet<CanType> CIntegerTypes;
 
   /// The set of expressions currently being analyzed for failures.
   llvm::DenseMap<Expr*, Expr*> DiagnosedExprs;
 
-  /// A set of types that are representable in Objective-C, but require
-  /// non-trivial bridging.
-  ///
-  /// The value of the map is a flag indicating whether the bridged
-  /// type can be optional.
-  llvm::DenseMap<CanType, bool> ObjCRepresentableTypes;
-
   Module *StdlibModule = nullptr;
 
   /// The index of the next response metavariable to bind to a REPL result.
   unsigned NextResponseVariableIndex = 0;
+
+  /// If non-zero, warn when a function body takes longer than this many
+  /// milliseconds to type-check.
+  ///
+  /// Intended for debugging purposes only.
+  unsigned WarnLongFunctionBodies = 0;
 
   /// If true, the time it takes to type-check each function will be dumped
   /// to llvm::errs().
@@ -554,7 +617,7 @@ private:
   /// A helper to construct and typecheck call to super.init().
   ///
   /// \returns NULL if the constructed expression does not typecheck.
-  Expr* constructCallToSuperInit(ConstructorDecl *ctor,  ClassDecl *ClDecl);
+  Expr* constructCallToSuperInit(ConstructorDecl *ctor, ClassDecl *ClDecl);
 
 public:
   TypeChecker(ASTContext &Ctx) : TypeChecker(Ctx, Ctx.Diags) { }
@@ -566,6 +629,14 @@ public:
   /// Dump the time it takes to type-check each function to llvm::errs().
   void enableDebugTimeFunctionBodies() {
     DebugTimeFunctionBodies = true;
+  }
+
+  /// If \p timeInMS is non-zero, warn when a function body takes longer than
+  /// this many milliseconds to type-check.
+  ///
+  /// Intended for debugging purposes only.
+  void setWarnLongFunctionBodies(unsigned timeInMS) {
+    WarnLongFunctionBodies = timeInMS;
   }
 
   bool getInImmediateMode() {
@@ -636,12 +707,8 @@ public:
   void checkUnsupportedProtocolType(Stmt *stmt);
 
   /// Expose TypeChecker's handling of GenericParamList to SIL parsing.
-  /// We pass in a vector of nested GenericParamLists and a vector of
-  /// ArchetypeBuilders with the innermost GenericParamList in the beginning
-  /// of the vector.
-  bool handleSILGenericParams(SmallVectorImpl<ArchetypeBuilder *> &builders,
-                              SmallVectorImpl<GenericParamList *> &gps,
-                              DeclContext *DC);
+  GenericSignature *handleSILGenericParams(GenericParamList *genericParams,
+                                           DeclContext *DC);
 
   /// \brief Resolves a TypeRepr to a type.
   ///
@@ -898,10 +965,18 @@ public:
   AnyFunctionType::ExtInfo
   applyFunctionTypeAttributes(AbstractFunctionDecl *func, unsigned i);
 
+  /// Infer default value witnesses for all requirements in the given protocol.
+  void inferDefaultWitnesses(ProtocolDecl *proto);
+
   /// Determine whether the given (potentially constrained) protocol extension
   /// is usable for the given type.
   bool isProtocolExtensionUsable(DeclContext *dc, Type type,
                                  ExtensionDecl *protocolExtension) override;
+
+  void markInvalidGenericSignature(ValueDecl *VD);
+
+  /// Configure the interface type of a function declaration.
+  void configureInterfaceType(AbstractFunctionDecl *func);
 
   /// Validate the signature of a generic function.
   ///
@@ -949,13 +1024,13 @@ public:
   /// \param nominal The generic type.
   ///
   /// \returns true if an error occurred, or false otherwise.
-  bool validateGenericTypeSignature(NominalTypeDecl *nominal);
+  bool validateGenericTypeSignature(GenericTypeDecl *nominal);
 
   /// Check the generic parameters in the given generic parameter list (and its
   /// parent generic parameter lists) according to the given resolver.
   bool checkGenericParamList(ArchetypeBuilder *builder,
                              GenericParamList *genericParams,
-                             DeclContext *parentDC,
+                             GenericSignature *parentSig,
                              bool adoptArchetypes = true,
                              GenericTypeResolver *resolver = nullptr);
 
@@ -975,17 +1050,6 @@ public:
                              Type owner,
                              GenericSignature *genericSig,
                              ArrayRef<Type> genericArgs);
-
-  /// Given a type that was produced within the given generic declaration
-  /// context, produce the corresponding interface type.
-  ///
-  /// \param dc The declaration context in which the type was produced.
-  ///
-  /// \param type The type, which involves archetypes but not dependent types.
-  ///
-  /// \returns the type after mapping all archetypes to their corresponding
-  /// dependent types.
-  Type getInterfaceTypeFromInternalType(DeclContext *dc, Type type);
 
   /// Resolve the superclass of the given class.
   void resolveSuperclass(ClassDecl *classDecl) override;
@@ -1025,6 +1089,13 @@ public:
   /// enum with a raw type.
   void addImplicitEnumConformances(EnumDecl *ED);
 
+  /// Ensure that the specified \c storage has accessors.
+  ///
+  /// \param wantMaterializeForSet Whether we need materializeForSet
+  /// synthesized.
+  void synthesizeAccessorsForStorage(AbstractStorageDecl *storage,
+                                     bool wantMaterializeForSet);
+
   /// The specified AbstractStorageDecl \c storage was just found to satisfy
   /// the protocol property \c requirement.  Ensure that it has the full
   /// complement of accessors.
@@ -1034,6 +1105,32 @@ public:
   /// Provide storage and accessor implementations for the given property,
   /// which must be lazy.
   void completeLazyVarImplementation(VarDecl *lazyVar);
+  
+  /// Instantiate the storage implementation for a behavior-backed property.
+  void completePropertyBehaviorStorage(VarDecl *VD,
+                               VarDecl *BehaviorStorage,
+                               FuncDecl *DefaultInitStorage,
+                               FuncDecl *ParamInitStorage,
+                               Type SelfTy,
+                               Type StorageTy,
+                               NormalProtocolConformance *BehaviorConformance,
+                               ArrayRef<Substitution> SelfInterfaceSubs,
+                               ArrayRef<Substitution> SelfContextSubs);
+  
+  /// Instantiate the parameter implementation for a behavior-backed
+  /// property.
+  void completePropertyBehaviorParameter(VarDecl *VD,
+                               FuncDecl *BehaviorParameter,
+                               NormalProtocolConformance *BehaviorConformance,
+                               ArrayRef<Substitution> SelfInterfaceSubs,
+                               ArrayRef<Substitution> SelfContextSubs);
+  
+  /// Instantiate the accessor implementations for a behavior-backed
+  /// property.
+  void completePropertyBehaviorAccessors(VarDecl *VD,
+                                     VarDecl *ValueImpl,
+                                     ArrayRef<Substitution> SelfInterfaceSubs,
+                                     ArrayRef<Substitution> SelfContextSubs);
 
   /// Sets up and solves the constraint system \p cs to type check the given
   /// expression.
@@ -1082,7 +1179,9 @@ public:
   /// \param convertType The type that the expression is being converted to,
   /// or null if the expression is standalone.  If the 'ConvertTypeIsOnlyAHint'
   /// option is specified, then this is only a hint, it doesn't produce a full
-  /// conversion constraint.
+  /// conversion constraint. The location information is only used for
+  /// diagnostics should the conversion fail; it is safe to pass a TypeLoc
+  /// without location information.
   ///
   /// \param options Options that control how type checking is performed.
   ///
@@ -1092,14 +1191,14 @@ public:
   ///
   /// \returns true if an error occurred, false otherwise.
   bool typeCheckExpression(Expr *&expr, DeclContext *dc,
-                           Type convertType = Type(),
+                           TypeLoc convertType = TypeLoc(),
                            ContextualTypePurpose convertTypePurpose =CTP_Unused,
                            TypeCheckExprOptions options =TypeCheckExprOptions(),
                            ExprTypeCheckListener *listener = nullptr);
 
   bool typeCheckExpression(Expr *&expr, DeclContext *dc,
                            ExprTypeCheckListener *listener) {
-    return typeCheckExpression(expr, dc, Type(), CTP_Unused,
+    return typeCheckExpression(expr, dc, TypeLoc(), CTP_Unused,
                                TypeCheckExprOptions(), listener);
   }
 
@@ -1132,13 +1231,21 @@ public:
   /// \param expr The expression to type-check, which will be modified in
   /// place.
   ///
-  /// \param convertType The type that the expression is being converted to,
-  /// or null if the expression is standalone.
-  ///
   /// \returns true if an error occurred, false otherwise.
-  bool typeCheckExpressionShallow(Expr *&expr, DeclContext *dc,
-                                  Type convertType = Type());
+  bool typeCheckExpressionShallow(Expr *&expr, DeclContext *dc);
 
+  /// Check the key-path expression.
+  ///
+  /// Returns the type of the last component of the key-path.
+  Optional<Type> checkObjCKeyPathExpr(DeclContext *dc, ObjCKeyPathExpr *expr,
+                                      bool requireResultType = false);
+
+  /// \brief Type check whether the given type declaration includes members of
+  /// unsupported recursive value types.
+  ///
+  /// \param decl The declaration to be type-checked. This process will not
+  /// modify the declaration.
+  void checkDeclCircularity(NominalTypeDecl *decl);
 
   /// \brief Type check the given expression as a condition, which converts
   /// it to a logic value.
@@ -1318,9 +1425,12 @@ public:
   ///
   /// \param expr The expression, which will be updated in place.
   /// \param type The type to convert to.
+  /// \param typeFromPattern Optionally, the caller can specify the pattern
+  ///   from where the toType is derived, so that we can deliver better fixit.
   ///
   /// \returns true if an error occurred, false otherwise.
-  bool convertToType(Expr *&expr, Type type, DeclContext *dc);
+  bool convertToType(Expr *&expr, Type type, DeclContext *dc,
+                     Optional<Pattern*> typeFromPattern = None);
 
   /// \brief Coerce the given expression to an rvalue, if it isn't already.
   Expr *coerceToRValue(Expr *expr);
@@ -1443,6 +1553,34 @@ public:
                           ProtocolConformance **Conformance = nullptr,
                           SourceLoc ComplainLoc = SourceLoc());
 
+  /// Completely check the given conformance.
+  void checkConformance(NormalProtocolConformance *conformance);
+
+  /// Check all of the conformances in the given context.
+  void checkConformancesInContext(DeclContext *dc,
+                                  IterableDeclContext *idc);
+
+  /// Find the @objc requirement that are witnessed by the given
+  /// declaration.
+  ///
+  /// \param onlyFirstRequirement If true, only returns the first such
+  /// requirement, rather than all of them.
+  ///
+  /// \returns the set of requirements to which the given witness is a
+  /// witness.
+  llvm::TinyPtrVector<ValueDecl *> findWitnessedObjCRequirements(
+                                     const ValueDecl *witness,
+                                     bool onlyFirstRequirement);
+
+  /// Mark any _ObjectiveCBridgeable conformances in the given type as "used".
+  void useObjectiveCBridgeableConformances(DeclContext *dc, Type type);
+
+  /// If this bound-generic type is bridged, mark any
+  /// _ObjectiveCBridgeable conformances in the generic arguments of
+  /// the given type as "used".
+  void useObjectiveCBridgeableConformancesOfArgs(DeclContext *dc,
+                                                 BoundGenericType *bound);
+
   /// Derive an implicit declaration to satisfy a requirement of a derived
   /// protocol conformance.
   ///
@@ -1523,19 +1661,26 @@ public:
                                    Identifier name, SourceLoc nameLoc,
                                    LookupTypeResult &lookup);
 
+  void diagnoseUnavailableOverride(ValueDecl *override,
+                                   const ValueDecl *base,
+                                   const AvailableAttr *attr);
+
   /// Emit a diagnostic for references to declarations that have been
-  /// marked as unavailable, either through "unavailable" or "obsoleted=".
+  /// marked as unavailable, either through "unavailable" or "obsoleted:".
   bool diagnoseExplicitUnavailability(const ValueDecl *D,
                                       SourceRange R,
-                                      const DeclContext *DC);
+                                      const DeclContext *DC,
+                                      const ApplyExpr *call);
+
+  /// Emit a diagnostic for references to declarations that have been
+  /// marked as unavailable, either through "unavailable" or "obsoleted:".
+  bool diagnoseExplicitUnavailability(
+      const ValueDecl *D,
+      SourceRange R,
+      const DeclContext *DC,
+      llvm::function_ref<void(InFlightDiagnostic &)> attachRenameFixIts);
 
   /// @}
-
-  /// Fix the name of the given function to the target name, attaching
-  /// Fix-Its to the provided in-flight diagnostic.
-  void fixAbstractFunctionNames(InFlightDiagnostic &diag,
-                                AbstractFunctionDecl *func,
-                                DeclName targetName);
 
   /// \name Overload resolution
   ///
@@ -1581,6 +1726,9 @@ public:
 
   DeclName getObjectLiteralConstructorName(ObjectLiteralExpr *expr);
 
+  Type getObjectLiteralParameterType(ObjectLiteralExpr *expr,
+                                     ConstructorDecl *ctor);
+
   /// Get the module appropriate for looking up standard library types.
   ///
   /// This is "Swift", if that module is imported, or the current module if
@@ -1597,7 +1745,6 @@ public:
   ///
   /// Routines that perform lazy resolution as required for AST operations.
   /// @{
-  void checkConformance(NormalProtocolConformance *conformance) override;
   void resolveTypeWitness(const NormalProtocolConformance *conformance,
                           AssociatedTypeDecl *assocType) override;
   void resolveWitness(const NormalProtocolConformance *conformance,
@@ -1611,8 +1758,6 @@ public:
                              Optional<ForeignErrorConvention> &errorConvention);
   bool isRepresentableInObjC(const VarDecl *VD, ObjCReason Reason);
   bool isRepresentableInObjC(const SubscriptDecl *SD, ObjCReason Reason);
-  bool isTriviallyRepresentableInObjC(const DeclContext *DC, Type T);
-  bool isRepresentableInObjC(const DeclContext *DC, Type T);
 
   void diagnoseTypeNotRepresentableInObjC(const DeclContext *DC,
                                           Type T, SourceRange TypeRange);
@@ -1633,18 +1778,18 @@ public:
 
   /// \brief Returns true if the availability of the witness
   /// is sufficient to safely conform to the requirement in the context
-  /// the provided conformance. On return, requiredRange holds the range
-  /// required for conformance.
-  bool isAvailabilitySafeForConformance(ValueDecl *witness,
-                                        ValueDecl *requirement,
-                                        NormalProtocolConformance *conformance,
-                                        VersionRange &requiredRange);
+  /// the provided conformance. On return, requiredAvailability holds th
+  /// availability levels required for conformance.
+  bool
+  isAvailabilitySafeForConformance(ProtocolDecl *proto, ValueDecl *requirement,
+                                   ValueDecl *witness, DeclContext *dc,
+                                   AvailabilityContext &requiredAvailability);
 
   /// Returns an over-approximation of the range of operating system versions
   /// that could the passed-in location could be executing upon for
   /// the target platform.
-  VersionRange overApproximateOSVersionsAtLocation(SourceLoc loc,
-                                                   const DeclContext *DC);
+  AvailabilityContext
+  overApproximateAvailabilityAtLocation(SourceLoc loc, const DeclContext *DC);
 
   /// Walk the AST to build the hierarchy of TypeRefinementContexts
   ///
@@ -1669,11 +1814,11 @@ public:
   /// reference DeclContext).
   /// If the declaration is available, return true.
   /// If the declaration is not available, return false and write the
-  /// declaration's available version range to the out parameter
-  /// OutAvailableRange.
+  /// declaration's availability info to the out parameter
+  /// \p OutAvailableRange.
   bool isDeclAvailable(const Decl *D, SourceLoc referenceLoc,
                        const DeclContext *referenceDC,
-                       VersionRange &OutAvailableRange);
+                       AvailabilityContext &OutAvailableRange);
 
   /// Checks whether a declaration should be considered unavailable when
   /// referred to at the given location and, if so, returns the reason why the
@@ -1720,6 +1865,11 @@ public:
   /// Returns true if the reference or any of its parents is an
   /// unavailable (or obsoleted) declaration.
   bool isInsideUnavailableDeclaration(SourceRange ReferenceRange,
+                                      const DeclContext *DC);
+
+  /// Returns true if the reference is lexically contained in a declaration
+  /// that is deprecated on all deployment targets.
+  bool isInsideDeprecatedDeclaration(SourceRange ReferenceRange,
                                      const DeclContext *DC);
 
   /// Returns the availability attribute indicating deprecation if the
@@ -1733,8 +1883,7 @@ public:
                           const DeclContext *ReferenceDC,
                           const AvailableAttr *Attr,
                           DeclName Name,
-              std::function<void(InFlightDiagnostic&)> extraInfoHandler =
-                          [](InFlightDiagnostic&){});
+                          const ApplyExpr *Call);
   /// @}
 
   /// If LangOptions::DebugForbidTypecheckPrefix is set and the given decl
@@ -1777,6 +1926,12 @@ public:
                                               ConstructorDecl *ctorDecl,
                                               bool SuppressDiagnostics);
 
+  /// Attempt to omit needless words from the name of the given declaration.
+  Optional<DeclName> omitNeedlessWords(AbstractFunctionDecl *afd);
+
+  /// Attempt to omit needless words from the name of the given declaration.
+  Optional<Identifier> omitNeedlessWords(VarDecl *var);
+
   /// Check for needless words in the name of the given function/constructor.
   void checkOmitNeedlessWords(AbstractFunctionDecl *afd);
 
@@ -1789,6 +1944,18 @@ public:
 
   /// Check for needless words in the member reference.
   void checkOmitNeedlessWords(MemberRefExpr *memberRef);
+
+  /// Check for a typo correction.
+  void performTypoCorrection(DeclContext *DC,
+                             DeclRefKind refKind,
+                             DeclName name,
+                             SourceLoc lookupLoc,
+                             NameLookupOptions lookupOptions,
+                             LookupResult &result,
+                             unsigned maxResults = 4);
+
+  void noteTypoCorrection(DeclName name, DeclNameLoc nameLoc,
+                          const LookupResult::Result &suggestion);
 };
 
 /// \brief RAII object that cleans up the given expression if not explicitly
